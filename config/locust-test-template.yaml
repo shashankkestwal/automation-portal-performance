@@ -1,0 +1,30 @@
+apiVersion: locust.io/v2
+kind: LocustTest
+metadata:
+  name: ${SCENARIO}.test
+spec:
+  image: quay.io/backstage-performance/locust:latest-2.x
+  imagePullPolicy: Always
+  master:
+    command: >-
+      --locustfile /lotest/src/${SCENARIO}.py
+      --host ${PORTAL_URL}
+      --users ${USERS}
+      --spawn-rate ${SPAWN_RATE}
+      --run-time ${DURATION}
+      --aap-url ${AAP_URL}
+      --aap-password ${AAP_PASSWORD}
+    extraArgs:
+      - "--loglevel"
+      - "INFO"
+  worker:
+    command: >-
+      --locustfile /lotest/src/${SCENARIO}.py
+      --aap-url ${AAP_URL}
+      --aap-password ${AAP_PASSWORD}
+    extraArgs:
+      - "--loglevel"
+      - "INFO"
+    replicas: ${WORKERS}
+  testFiles:
+    configMapRef: locust.${SCENARIO}
