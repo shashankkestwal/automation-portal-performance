@@ -391,9 +391,8 @@ class PortalUser(HttpUser):
 
     @task
     def user_journey(self):
-        time.sleep(20)
-        # self._phase_auth()
-        # self._phase_catalog()
-        # self._phase_sync()
-        # self._phase_scaffolder()
-        # self._phase_history()
+        self._phase_auth()
+        self._phase_catalog()
+        self._phase_sync()
+        self._phase_scaffolder()
+        self._phase_history()

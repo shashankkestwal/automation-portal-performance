@@ -1,0 +1,30 @@
+# Total request count across all Locust-named endpoints (no {{name}} here — that variable only exists inside results_scenario).
+- name: total_requests
+  monitoring_query: sum(locust_requests_num_requests{namespace="${LOCUST_NAMESPACE}", job="${SCENARIO}-test-master"})
+  monitoring_step: 15
+# Results
+{%macro results_scenario(name) -%}
+- name: results.{{name | replace('.', '_')}}.locust_requests_avg_response_time
+  monitoring_query: max(locust_requests_avg_response_time{name=~"{{name}}", namespace="${LOCUST_NAMESPACE}", job="${SCENARIO}-test-master"})
+  monitoring_step: 15
+- name: results.{{name | replace('.', '_')}}.locust_requests_current_rps
+  monitoring_query: max(locust_requests_current_rps{name=~"{{name}}", namespace="${LOCUST_NAMESPACE}", job="${SCENARIO}-test-master"})
+  monitoring_step: 15
+- name: results.{{name | replace('.', '_')}}.locust_requests_num_failures
+  monitoring_query: sum(locust_requests_num_failures{name=~"{{name}}", namespace="${LOCUST_NAMESPACE}", job="${SCENARIO}-test-master"})
+  monitoring_step: 15
+# Cumulative P99 per Locust request name (from /stats/requests response_time_percentile_0.99 → exporter: locust_requests_response_time_percentile_99). Not the global "current" sliding-window percentile.
+- name: results.{{name | replace('.', '_')}}.locust_requests_p99_response_time
+  monitoring_query: max(locust_requests_response_time_percentile_99{name=~"{{name}}", namespace="${LOCUST_NAMESPACE}", job="${SCENARIO}-test-master"})
+  monitoring_step: 15
+- name: results.{{name | replace('.', '_')}}.locust_requests_avg_content_length
+  monitoring_query: max(locust_requests_avg_content_length{name=~"{{name}}", namespace="${LOCUST_NAMESPACE}", job="${SCENARIO}-test-master"})
+  monitoring_step: 15
+{%- endmacro %}
+
+{{ results_scenario('\\[scaffolder\\].*\\|.*') }}
+{{ results_scenario('\\[history\\].*\\|.*') }}
+{{ results_scenario('\\[sync\\].*\\|.*') }}
+{{ results_scenario('\\[catalog\\].*\\|.*') }}
+{{ results_scenario('\\[auth\\].*\\|.*') }}
+ 
