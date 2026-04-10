@@ -18,10 +18,11 @@ export TMP_DIR
 TMP_DIR=$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "${TMP_DIR:-${REPO_ROOT}/.tmp}")
 mkdir -p "${TMP_DIR}"
 
-export LOCUST_NAMESPACE
-
 LOCUST_NAMESPACE="${LOCUST_NAMESPACE:-locust-operator}"
 SCENARIO="${SCENARIO:-mvp}"
+PORTAL_NAMESPACE="${PORTAL_NAMESPACE:-self-service-portal}"
+
+export LOCUST_NAMESPACE SCENARIO PORTAL_NAMESPACE
 
 cli="oc"
 
@@ -177,9 +178,17 @@ fi
 
 # Scenario specific metrics
 echo "$(date -u -Ins) Collecting Scenario specific metrics"
-if [ -f "test/${SCENARIO}.metrics.yaml" ]; then
-    envsubst <"test/${SCENARIO}.metrics.yaml" >"${metrics_config_dir}/${SCENARIO}.metrics.yaml"
-    collect_additional_metrics "${metrics_config_dir}/${SCENARIO}.metrics.yaml"
+if [ -f "config/prometheus/${SCENARIO}.scenario.yaml" ]; then
+    collect_additional_metrics "config/prometheus/${SCENARIO}.scenario.yaml"
+else
+    echo "$(date -u -Ins) Skipping scenario metrics: config/prometheus/${SCENARIO}.scenario.yaml not found"
+fi
+
+# Cluster level metrics
+if [ -f "config/prometheus/cluster_read_metrics.yaml" ]; then
+    collect_additional_metrics "config/prometheus/cluster_read_metrics.yaml"
+else
+    echo "$(date -u -Ins) Skipping cluster level metrics: config/prometheus/cluster_read_metrics.yaml not found"
 fi
 
 set +u

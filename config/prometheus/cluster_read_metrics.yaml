@@ -1,0 +1,26 @@
+{% macro monitor_pod(alias, namespace_regex, pod_regex, step=15, pod_suffix_regex='-[0-9a-f]+-.*') -%}
+- name: measurements.{{ alias }}.cpu
+  monitoring_query: sum(pod:container_cpu_usage:sum{namespace=~'{{ namespace_regex }}', pod=~'{{ pod_regex }}{{ pod_suffix_regex }}'})
+  monitoring_step: {{ step }}
+- name: measurements.{{ alias }}.memory
+  monitoring_query: sum(container_memory_usage_bytes{namespace=~'{{ namespace_regex }}', pod=~'{{ pod_regex }}{{ pod_suffix_regex }}', container!='POD', container!=''})
+  monitoring_step: {{ step }}
+- name: measurements.{{ alias }}.network_throughput
+  monitoring_query: sum( rate(container_network_transmit_bytes_total{namespace=~'{{ namespace_regex }}', pod=~'{{ pod_regex }}{{ pod_suffix_regex }}'}[{{ step * 4 }}s]) + rate(container_network_receive_bytes_total{namespace=~'{{ namespace_regex }}', pod=~'{{ pod_regex }}{{ pod_suffix_regex }}'}[{{ step * 4 }}s]) )
+  monitoring_step: {{ step * 4 }}
+- name: measurements.{{ alias }}.network_drop
+  monitoring_query: sum( rate(container_network_transmit_packets_dropped_total{namespace=~'{{ namespace_regex }}', pod=~'{{ pod_regex }}{{ pod_suffix_regex }}'}[{{ step * 4 }}s]) + rate(container_network_receive_packets_dropped_total{namespace=~'{{ namespace_regex }}', pod=~'{{ pod_regex }}{{ pod_suffix_regex }}'}[{{ step * 4 }}s]) )
+  monitoring_step: {{ step * 4 }}
+- name: measurements.{{ alias }}.disk_throughput
+  monitoring_query: sum( sum(rate(container_fs_reads_bytes_total{namespace=~'{{ namespace_regex }}', pod=~'{{ pod_regex }}{{ pod_suffix_regex }}', device!='/dev/dm-0'}[{{ step * 4 }}s])) + sum(rate(container_fs_writes_bytes_total{namespace=~'{{ namespace_regex }}', pod=~'{{ pod_regex }}{{ pod_suffix_regex }}', device!='/dev/dm-0'}[{{ step * 4 }}s])) )
+  monitoring_step: {{ step * 4 }}
+- name: measurements.{{ alias }}.restarts
+  monitoring_query: sum(kube_pod_container_status_restarts_total{namespace=~'{{ namespace_regex }}', pod=~'{{ pod_regex }}{{ pod_suffix_regex }}'})
+  monitoring_step: {{ step }}
+- name: measurements.{{ alias }}.count_ready
+  monitoring_query: sum( kube_pod_status_ready{namespace=~'{{ namespace_regex }}', pod=~'{{ pod_regex }}{{ pod_suffix_regex }}'} )
+  monitoring_step: {{ step }}
+{%- endmacro %}
+
+{{ monitor_pod('automation_platform-app', PORTAL_NAMESPACE, PORTAL_NAMESPACE ~ '-app', 15) }}
+{{ monitor_pod('automation_platform-postgres', PORTAL_NAMESPACE, PORTAL_NAMESPACE ~ '-(postgresql|psql)', 15, '-.*') }}

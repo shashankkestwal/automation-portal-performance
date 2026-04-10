@@ -12,8 +12,8 @@ export PORTAL_NAMESPACE ?= self-service-portal
 export AAP_NAMESPACE ?= ansible-automation-platform
 
 # Route names within each namespace
-PORTAL_ROUTE ?= ssap
-AAP_ROUTE ?= aap
+export PORTAL_ROUTE ?= sap
+export AAP_ROUTE ?= aap
 
 # Secret containing AAP admin password (data key: password)
 AAP_ADMIN_SECRET ?= $(AAP_ROUTE)-admin-password
@@ -24,7 +24,7 @@ export WORKERS ?= 5
 # Locust load parameters (sensible defaults, override as needed)
 export USERS ?= 10
 export SPAWN_RATE ?= 2
-export DURATION ?= 60s
+export DURATION ?= 10s
 export LOCUST_EXTRA_CMD ?= "--debug=true"
 
 # Locust operator
@@ -93,16 +93,17 @@ endif
 	envsubst '$$PORTAL_URL $$AAP_URL $$AAP_PASSWORD' < test/$(SCENARIO).py > $(TMP_DIR)/$(SCENARIO).py; \
 	envsubst < config/locust-test-template.yaml | tee $(TMP_DIR)/locust-test.yaml | kubectl apply --namespace $(LOCUST_NAMESPACE) -f -
 	kubectl create --namespace $(LOCUST_NAMESPACE) configmap locust.$(SCENARIO) --from-file $(TMP_DIR)/$(SCENARIO).py --dry-run=client -o yaml | kubectl apply --namespace $(LOCUST_NAMESPACE) -f -
+	envsubst < config/locust-metrics-service-template.yaml | kubectl apply --namespace $(LOCUST_NAMESPACE) -f -
 	timeout=$$(python3 -c "from datetime import datetime, timedelta;t_add=int('680'); print(int((datetime.now() + timedelta(seconds=t_add)).timestamp()))"); while [ -z "$$(kubectl get --namespace $(LOCUST_NAMESPACE) pod -l performance-test-pod-name=$(SCENARIO)-test-master -o name)" ]; do if [ "$$(date "+%s")" -gt "$$timeout" ]; then echo "ERROR: Timeout waiting for locust master pod to start"; exit 1; else echo "Waiting for locust master pod to start..."; sleep 5s; fi; done
 	date -u -Ins>$(TMP_DIR)/benchmark-before
 	kubectl wait --namespace $(LOCUST_NAMESPACE) --for=condition=Ready=true $$(kubectl get --namespace $(LOCUST_NAMESPACE) pod -l performance-test-pod-name=$(SCENARIO)-test-master -o name) --timeout=60s
-	date -u -Ins>$(TMP_DIR)/benchmark-after
 	@echo "Getting locust master log:"
 	kubectl logs --namespace $(LOCUST_NAMESPACE) -f -l performance-test-pod-name=$(SCENARIO)-test-master | tee $(TMP_DIR)/load-test.log
+	date -u -Ins>$(TMP_DIR)/benchmark-after
 	@echo "Test completed at $$(date -u -Ins)"
 
-.PHONY: collect-result
-collect-result:
+.PHONY: collect-results
+collect-results:
 	@echo "Collecting results..."
 	./core/collect-result.sh
 
@@ -112,6 +113,8 @@ collect-result:
 clean:
 	kubectl delete --namespace $(LOCUST_NAMESPACE) cm locust.$(SCENARIO) --ignore-not-found --wait
 	kubectl delete --namespace $(LOCUST_NAMESPACE) locusttests.locust.io $(SCENARIO).test --ignore-not-found --wait || true
+	kubectl delete --namespace $(LOCUST_NAMESPACE) servicemonitor $(SCENARIO)-test-metrics --ignore-not-found --wait
+	kubectl delete --namespace $(LOCUST_NAMESPACE) svc $(SCENARIO)-test-metrics --ignore-not-found --wait
 
 ## Remove local artifacts
 .PHONY: clean-local
