@@ -2,6 +2,7 @@ import json
 import re
 import time
 import logging
+import uuid
 from urllib.parse import unquote
 
 import urllib3
@@ -143,8 +144,6 @@ class PortalUser(HttpUser):
                 resp.failure(f"Expected 200, got {resp.status_code}")
                 raise RuntimeError("Login page failed")
             resp.success()
-        logger.info("login page response %s", resp.text)
-        logger.info("login page response %s", resp.text)
         csrf = _extract_csrf_from_cookies(self.client)
         if not csrf:
             raise RuntimeError("No CSRF token")
@@ -298,15 +297,18 @@ class PortalUser(HttpUser):
         name = self.template_name
 
         self._get(
-            f"/api/scaffolder/v2/templates/{ns}/{name}/parameter-schema",
+            f"/api/scaffolder/v2/templates/{ns}/template/{name}/parameter-schema",
             "[scaffolder] GET /api/scaffolder/v2/templates/.../parameter-schema")
         self._get(
             f"/api/catalog/entities/by-name/template/{ns}/{name}",
             "[scaffolder] GET /api/catalog/entities/by-name/template/...")
 
+        id = str(uuid.uuid4())
         task_body = {
             "templateRef": f"template:{ns}/{name}",
-            "values": {},
+            "values": {
+                "token": id,
+            },
         }
 
         with self.client.post(
