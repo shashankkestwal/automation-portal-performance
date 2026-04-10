@@ -43,6 +43,7 @@ export TMP_DIR ?= $(shell python3 -c 'import os, sys; print(os.path.realpath(sys
 .PHONY: namespace
 namespace:
 	@kubectl create namespace $(LOCUST_NAMESPACE) --dry-run=client -o yaml | kubectl apply -f -
+	@echo "Enabling Prometheus monitoring for namespace $(LOCUST_NAMESPACE)..."
 
 ## Create temp directory
 $(TMP_DIR):
@@ -93,6 +94,11 @@ endif
 	envsubst '$$PORTAL_URL $$AAP_URL $$AAP_PASSWORD' < test/$(SCENARIO).py > $(TMP_DIR)/$(SCENARIO).py; \
 	envsubst < config/locust-test-template.yaml | tee $(TMP_DIR)/locust-test.yaml | kubectl apply --namespace $(LOCUST_NAMESPACE) -f -
 	kubectl create --namespace $(LOCUST_NAMESPACE) configmap locust.$(SCENARIO) --from-file $(TMP_DIR)/$(SCENARIO).py --dry-run=client -o yaml | kubectl apply --namespace $(LOCUST_NAMESPACE) -f -
+
+	@echo "Waiting for Locust operator to create the service..."
+	timeout=$$(python3 -c "from datetime import datetime, timedelta;t_add=int('60'); print(int((datetime.now() + timedelta(seconds=t_add)).timestamp()))"); while [ -z "$$(kubectl get --namespace $(LOCUST_NAMESPACE) svc $(SCENARIO)-test-master -o name 2>/dev/null)" ]; do if [ "$$(date "+%s")" -gt "$$timeout" ]; then echo "ERROR: Timeout waiting for service $(SCENARIO)-test-master"; exit 1; else echo "Waiting for service..."; sleep 2s; fi; done
+	@echo "Labeling the Locust service for Prometheus discovery..."
+	kubectl label --namespace $(LOCUST_NAMESPACE) svc $(SCENARIO)-test-master app=locust-test scenario=$(SCENARIO) --overwrite
 	envsubst < config/locust-metrics-service-template.yaml | kubectl apply --namespace $(LOCUST_NAMESPACE) -f -
 	timeout=$$(python3 -c "from datetime import datetime, timedelta;t_add=int('680'); print(int((datetime.now() + timedelta(seconds=t_add)).timestamp()))"); while [ -z "$$(kubectl get --namespace $(LOCUST_NAMESPACE) pod -l performance-test-pod-name=$(SCENARIO)-test-master -o name)" ]; do if [ "$$(date "+%s")" -gt "$$timeout" ]; then echo "ERROR: Timeout waiting for locust master pod to start"; exit 1; else echo "Waiting for locust master pod to start..."; sleep 5s; fi; done
 	date -u -Ins>$(TMP_DIR)/benchmark-before
@@ -107,6 +113,7 @@ collect-results:
 	@echo "Collecting results..."
 	./core/collect-result.sh
 
+
 ## Remove test resources from cluster
 ## Run `make clean SCENARIO=...` to clean a specific scenario
 .PHONY: clean
@@ -115,7 +122,6 @@ clean:
 	kubectl delete --namespace $(LOCUST_NAMESPACE) locusttests.locust.io $(SCENARIO).test --ignore-not-found --wait || true
 	kubectl delete --namespace $(LOCUST_NAMESPACE) servicemonitor $(SCENARIO)-test-metrics --ignore-not-found --wait
 	kubectl delete --namespace $(LOCUST_NAMESPACE) svc $(SCENARIO)-test-metrics --ignore-not-found --wait
-
 ## Remove local artifacts
 .PHONY: clean-local
 clean-local:

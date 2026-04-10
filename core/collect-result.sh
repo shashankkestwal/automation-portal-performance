@@ -166,15 +166,15 @@ status_data.py \
     measurements.timings.benchmark.started="$benchmark_started" \
     measurements.timings.benchmark.ended="$benchmark_ended" \
     measurements.timings.benchmark.duration="$benchmark_duration" \
-    name="Automation Portal performance test ( ${SCENARIO} )" \
+    name="Automation Portal performance test (${SCENARIO})" \
     metadata.scenario.name="$SCENARIO" \
     -d >"$monitoring_collection_log" 2>&1
 
-# Collect cluster-level metrics if config exists
-if [ -f "config/cluster_read_config.test.yaml" ]; then
-    envsubst <config/cluster_read_config.test.yaml >"${metrics_config_dir}/cluster_read_config.test.yaml"
-    collect_additional_metrics "${metrics_config_dir}/cluster_read_config.test.yaml"
-fi
+# # Collect cluster-level metrics if config exists
+# if [ -f "config/cluster_read_config.test.yaml" ]; then
+#     envsubst <config/cluster_read_config.test.yaml >"${metrics_config_dir}/cluster_read_config.test.yaml"
+#     collect_additional_metrics "${metrics_config_dir}/cluster_read_config.test.yaml"
+# fi
 
 # Scenario specific metrics
 echo "$(date -u -Ins) Collecting Scenario specific metrics"
@@ -183,7 +183,6 @@ if [ -f "config/prometheus/${SCENARIO}.scenario.yaml" ]; then
 else
     echo "$(date -u -Ins) Skipping scenario metrics: config/prometheus/${SCENARIO}.scenario.yaml not found"
 fi
-
 # Cluster level metrics
 if [ -f "config/prometheus/cluster_read_metrics.yaml" ]; then
     collect_additional_metrics "config/prometheus/cluster_read_metrics.yaml"
@@ -195,15 +194,15 @@ set +u
 deactivate
 set -u
 
-echo "$(date -u -Ins) Collecting error reports"
-# Error report
-find "$ARTIFACT_DIR" -name load-test.log -print0 | sort -V | while IFS= read -r file; do
-    if grep "Error report" "$file" >/dev/null; then
-        tail -n +"$(grep -n "Error report" "$file" | head -n 1 | cut -d ":" -f 1)" "$file"
-    else
-        echo 'No errors found!'
-    fi
-done >"$ARTIFACT_DIR/error-report.txt"
+# echo "$(date -u -Ins) Collecting error reports"
+# # Error report
+# find "$ARTIFACT_DIR" -name load-test.log -print0 | sort -V | while IFS= read -r file; do
+#     if grep "Error report" "$file" >/dev/null; then
+#         tail -n +"$(grep -n "Error report" "$file" | head -n 1 | cut -d ":" -f 1)" "$file"
+#     else
+#         echo 'No errors found!'
+#     fi
+# done >"$ARTIFACT_DIR/error-report.txt"
 
 echo -e "\n === Results collection complete ===\n"
 

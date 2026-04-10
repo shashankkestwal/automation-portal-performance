@@ -1,7 +1,7 @@
 .venv/
 .tmp/
+.artifacts/
 __pycache__/
-results/
 *.log
 *.pyc
 test.env

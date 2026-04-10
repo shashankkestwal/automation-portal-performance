@@ -22,5 +22,28 @@
   monitoring_step: {{ step }}
 {%- endmacro %}
 
-{{ monitor_pod('automation_platform-app', PORTAL_NAMESPACE, PORTAL_NAMESPACE ~ '-app', 15) }}
-{{ monitor_pod('automation_platform-postgres', PORTAL_NAMESPACE, PORTAL_NAMESPACE ~ '-(postgresql|psql)', 15, '-.*') }}
+{{ monitor_pod('automation_platform-app', 'skestwal-ssp', 'ssap-.*', 15, '-.*') }}
+{{ monitor_pod('automation_platform-postgres', 'skestwal-ssp', 'ssap-(postgresql|psql)', 15, '-.*') }}
+
+{%macro results_scenario(name) -%}
+- name: results.{{name}}.locust_requests_avg_response_time
+  monitoring_query: sum(locust_requests_avg_response_time{name="{{name}}", namespace="{{ LOCUST_NAMESPACE }}", job="{{ SCENARIO }}-test-master"})
+  monitoring_step: 15
+- name: results.{{name}}.locust_requests_avg_content_length
+  monitoring_query: sum(locust_requests_avg_content_length{name="{{name}}", namespace="{{ LOCUST_NAMESPACE }}", job="{{ SCENARIO }}-test-master"})
+  monitoring_step: 15
+- name: results.{{name}}.locust_requests_current_rps
+  monitoring_query: sum(locust_requests_current_rps{name="{{name}}", namespace="{{ LOCUST_NAMESPACE }}", job="{{ SCENARIO }}-test-master"})
+  monitoring_step: 15
+- name: results.{{name}}.locust_requests_current_fail_per_sec
+  monitoring_query: sum(locust_requests_current_fail_per_sec{name="{{name}}", namespace="{{ LOCUST_NAMESPACE }}", job="{{ SCENARIO }}-test-master"})
+  monitoring_step: 15
+- name: results.{{name}}.locust_requests_num_failures
+  monitoring_query: sum(locust_requests_num_failures{name="{{name}}", namespace="{{ LOCUST_NAMESPACE }}", job="{{ SCENARIO }}-test-master"})
+  monitoring_step: 15
+- name: results.{{name}}.locust_errors
+  monitoring_query: sum(locust_errors{name="{{name}}", namespace="{{ LOCUST_NAMESPACE }}", job="{{ SCENARIO }}-test-master"})
+  monitoring_step: 15
+{%- endmacro %}
+
+{{ results_scenario('Aggregated') }}

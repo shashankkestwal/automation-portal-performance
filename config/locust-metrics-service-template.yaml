@@ -6,15 +6,18 @@ metadata:
   labels:
     app: locust-test
     scenario: ${SCENARIO}
+
+    monitoring.openshift.io/collection-profile: full
+    openshift.io/user-monitoring: "true"
 spec:
   endpoints:
     - honorLabels: true
       interval: 10s
       port: prometheus-metrics
-  jobLabel: app
-  namespaceSelector:
+namespaceSelector:
     matchNames:
       - ${LOCUST_NAMESPACE}
   selector:
     matchLabels:
+      app: locust-test
       scenario: ${SCENARIO}
