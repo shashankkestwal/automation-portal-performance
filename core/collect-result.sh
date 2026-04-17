@@ -10,8 +10,16 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT="$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel 2>/dev/null || (cd "${SCRIPT_DIR}/.." && pwd))"
 cd "${REPO_ROOT}"
 
-ARTIFACT_DIR=$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "${ARTIFACT_DIR:-${REPO_ROOT}/.artifacts}")
+# Default: one directory per run under .artifacts/, named with local date-time and AM/PM.
+# Override: set ARTIFACT_DIR to a full path to write results there instead.
+if [[ -n "${ARTIFACT_DIR:-}" ]]; then
+	ARTIFACT_DIR=$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "${ARTIFACT_DIR}")
+else
+	ARTIFACT_STAMP="$(python3 -c 'from datetime import datetime; print(datetime.now().strftime("%Y-%m-%d_%I-%M-%S-%p"))')"
+	ARTIFACT_DIR=$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "${REPO_ROOT}/.artifacts/${ARTIFACT_STAMP}")
+fi
 mkdir -p "${ARTIFACT_DIR}"
+echo "Writing results to: ${ARTIFACT_DIR}"
 
 export TMP_DIR
 
@@ -84,7 +92,7 @@ try_gather_file "${TMP_DIR}/benchmark-after"
 try_gather_file "${TMP_DIR}/benchmark-scenario"
 try_gather_file "${TMP_DIR}/locust-k8s-operator.values.yaml"
 try_gather_file "${TMP_DIR}/locust-test.yaml"
-try_gather_file load-test.log
+try_gather_file "${TMP_DIR}/load-test.log"
 
 # Metrics
 PYTHON_VENV_DIR="${REPO_ROOT}/.venv"
