@@ -85,6 +85,7 @@ else
 	$(eval WORKERS := $(USERS))
 	@echo "Adjusted WORKERS to $(USERS) (workers must not exceed users)"
 endif
+	@if [ -f test.env ]; then cp -f test.env $(TMP_DIR)/test.env && echo "Snapshotted test.env -> $(TMP_DIR)/test.env"; fi
 	@PORTAL_URL="https://$$(oc -n $(PORTAL_NAMESPACE) get route $(PORTAL_ROUTE) -o jsonpath='{.spec.host}')"; \
 	AAP_URL="https://$$(oc -n $(AAP_NAMESPACE) get route $(AAP_ROUTE) -o jsonpath='{.spec.host}')"; \
 	AAP_PASSWORD="$$(oc -n $(AAP_NAMESPACE) get secret $(AAP_ADMIN_SECRET) -o jsonpath='{.data.password}' | base64 -d)"; \

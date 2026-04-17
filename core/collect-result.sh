@@ -76,6 +76,9 @@ try_gather_file "${TMP_DIR}/benchmark-after"
 try_gather_file "${TMP_DIR}/benchmark-scenario"
 try_gather_file "${TMP_DIR}/locust-k8s-operator.values.yaml"
 try_gather_file "${TMP_DIR}/locust-test.yaml"
+if [[ -f "${TMP_DIR}/test.env" ]]; then
+	try_gather_file "${TMP_DIR}/test.env"
+fi
 # Metrics
 PYTHON_VENV_DIR="${REPO_ROOT}/.venv"
 
