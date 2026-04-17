@@ -2,8 +2,6 @@ set -o nounset
 set -o errexit
 set -o pipefail
 
-echo -e "\n === Collecting test results and metrics ===\n"
-
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 # Always anchor paths at repo root, regardless of current working directory
@@ -19,52 +17,38 @@ else
 	ARTIFACT_DIR=$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "${REPO_ROOT}/.artifacts/${ARTIFACT_STAMP}")
 fi
 mkdir -p "${ARTIFACT_DIR}"
-echo "Writing results to: ${ARTIFACT_DIR}"
+APP_FRAMEWORK_LOG="${ARTIFACT_DIR}/app-framework.log"
+: >"${APP_FRAMEWORK_LOG}"
+
+fw_echo() {
+	local line
+	line="$(date -u -Ins) $*"
+	printf '%s\n' "$line" | tee -a "${APP_FRAMEWORK_LOG}"
+}
+
+fw_warn() {
+	local line
+	line="$(date -u -Ins) WARNING: $*"
+	printf '%s\n' "$line" | tee -a "${APP_FRAMEWORK_LOG}" >&2
+}
+
+{
+	echo ""
+	echo " === Collecting test results and metrics ==="
+	echo ""
+} | tee -a "${APP_FRAMEWORK_LOG}"
+
+fw_echo "Writing results to: ${ARTIFACT_DIR}"
 
 export TMP_DIR
 
 TMP_DIR=$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "${TMP_DIR:-${REPO_ROOT}/.tmp}")
 mkdir -p "${TMP_DIR}"
 
-LOCUST_NAMESPACE="${LOCUST_NAMESPACE:-locust-operator}"
 SCENARIO="${SCENARIO:-mvp}"
-PORTAL_NAMESPACE="${PORTAL_NAMESPACE:-self-service-portal}"
-
-export LOCUST_NAMESPACE SCENARIO PORTAL_NAMESPACE
+export SCENARIO
 
 cli="oc"
-
-# Logs
-gather_pod_logs() {
-    log_dir=$1
-    pods=$2
-    namespace=$3
-    mkdir -p "$log_dir"
-    echo -e "\nCollecting logs from pods in '$namespace' namespace:"
-    for pod in $pods; do
-        echo "$pod"
-        containers=$($cli -n "$namespace" get pod "$pod" -o json | jq -r '.spec.containers[].name')
-        if $cli -n "$namespace" get pod "$pod" -o json | jq -e '.spec.initContainers? // empty' >/dev/null; then
-            init_containers=$($cli -n "$namespace" get pod "$pod" -o json | jq -r '.spec.initContainers[].name // empty')
-        else
-            init_containers=""
-        fi
-        all_containers="$containers $init_containers"
-        for container in $all_containers; do
-            logfile_prefix="$log_dir/${pod##*/}.$container"
-            echo -e " -> $logfile_prefix.log"
-            $cli -n "$namespace" logs "$pod" -c "$container" --tail=-1 >&"$logfile_prefix.log" || true
-            echo -e " -> $logfile_prefix.previous.log"
-            $cli -n "$namespace" logs "$pod" -c "$container" --tail=-1 --previous=true >&"$logfile_prefix.previous.log" || true
-        done
-    done
-}
-
-# Collect Locust pod logs
-pods="$(oc -n "$LOCUST_NAMESPACE" get pods -o json | jq -r '.items[] | select(.metadata.name | contains("locust-operator")).metadata.name')"
-pods="$pods $(oc -n "$LOCUST_NAMESPACE" get pods -o json | jq -r '.items[] | select(.metadata.name | contains("test-worker")).metadata.name')"
-pods="$pods $(oc -n "$LOCUST_NAMESPACE" get pods -o json | jq -r '.items[] | select(.metadata.name | contains("test-master")).metadata.name')"
-# gather_pod_logs "${ARTIFACT_DIR}/locust-logs" "$pods" "$LOCUST_NAMESPACE"
 
 monitoring_collection_data=$ARTIFACT_DIR/benchmark.json
 monitoring_collection_log=$ARTIFACT_DIR/monitoring-collection.log
@@ -75,7 +59,7 @@ try_gather_file() {
     if [ -f "$1" ]; then
         cp -vf "$1" "${2:-$ARTIFACT_DIR}"
     else
-        echo "WARNING: Tried to gather $1 but the file was not found!"
+        fw_warn "Tried to gather $1 but the file was not found!"
     fi
 }
 
@@ -83,7 +67,7 @@ try_gather_dir() {
     if [ -d "$1" ]; then
         cp -rvf "$1" "${2:-$ARTIFACT_DIR}"
     else
-        echo "WARNING: Tried to gather $1 but the directory was not found!"
+        fw_warn "Tried to gather $1 but the directory was not found!"
     fi
 }
 
@@ -92,12 +76,11 @@ try_gather_file "${TMP_DIR}/benchmark-after"
 try_gather_file "${TMP_DIR}/benchmark-scenario"
 try_gather_file "${TMP_DIR}/locust-k8s-operator.values.yaml"
 try_gather_file "${TMP_DIR}/locust-test.yaml"
-try_gather_file "${TMP_DIR}/load-test.log"
 
 # Metrics
 PYTHON_VENV_DIR="${REPO_ROOT}/.venv"
 
-echo "$(date -u -Ins) Setting up tool to collect monitoring data"
+fw_echo "Setting up tool to collect monitoring data"
 python3 -m venv $PYTHON_VENV_DIR
 set +u
 # shellcheck disable=SC1090,SC1091
@@ -109,7 +92,7 @@ set +u
 deactivate
 set -u
 
-echo "$(date -u -Ins) Collecting monitoring data"
+fw_echo "Collecting monitoring data"
 set +u
 # shellcheck disable=SC1090,SC1091
 source $PYTHON_VENV_DIR/bin/activate
@@ -123,7 +106,7 @@ metrics_config_dir="${ARTIFACT_DIR}/metrics-config"
 mkdir -p "$metrics_config_dir"
 
 collect_additional_metrics() {
-    echo "$(date -u -Ins) Collecting metrics from $1"
+    fw_echo "Collecting metrics from $1"
     status_data.py \
         --status-data-file "$monitoring_collection_data" \
         --additional "$1" \
@@ -166,7 +149,7 @@ benchmark_started="$(python3 -c "from datetime import datetime, timezone; ts='$b
 benchmark_ended="$(python3 -c "from datetime import datetime, timezone; ts='$benchmark_ended_raw'.replace(',', '.'); dt=datetime.fromisoformat(ts).astimezone(timezone.utc); print(dt.isoformat());")"
 benchmark_duration="$(timestamp_diff "$benchmark_started" "$benchmark_ended")"
 
-echo "$(date -u -Ins) Collecting Test phase metrics"
+fw_echo "Collecting Test phase metrics"
 status_data.py \
     --status-data-file "$monitoring_collection_data" \
     --end \
@@ -185,17 +168,17 @@ status_data.py \
 # fi
 
 # Scenario specific metrics
-echo "$(date -u -Ins) Collecting Scenario specific metrics"
+fw_echo "Collecting Scenario specific metrics"
 if [ -f "config/prometheus/${SCENARIO}.scenario.yaml" ]; then
     collect_additional_metrics "config/prometheus/${SCENARIO}.scenario.yaml"
 else
-    echo "$(date -u -Ins) Skipping scenario metrics: config/prometheus/${SCENARIO}.scenario.yaml not found"
+    fw_echo "Skipping scenario metrics: config/prometheus/${SCENARIO}.scenario.yaml not found"
 fi
 # Cluster level metrics
 if [ -f "config/prometheus/cluster_read_metrics.yaml" ]; then
     collect_additional_metrics "config/prometheus/cluster_read_metrics.yaml"
 else
-    echo "$(date -u -Ins) Skipping cluster level metrics: config/prometheus/cluster_read_metrics.yaml not found"
+    fw_echo "Skipping cluster level metrics: config/prometheus/cluster_read_metrics.yaml not found"
 fi
 
 set +u
@@ -212,5 +195,9 @@ set -u
 #     fi
 # done >"$ARTIFACT_DIR/error-report.txt"
 
-echo -e "\n === Results collection complete ===\n"
+{
+	echo ""
+	echo " === Results collection complete ==="
+	echo ""
+} | tee -a "${APP_FRAMEWORK_LOG}"
 

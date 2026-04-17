@@ -14,9 +14,9 @@ spec:
     - honorLabels: true
       interval: 10s
       port: prometheus-metrics
-namespaceSelector:
-    matchNames:
-      - ${LOCUST_NAMESPACE}
+  namespaceSelector:
+      matchNames:
+        - ${LOCUST_NAMESPACE}
   selector:
     matchLabels:
       app: locust-test
