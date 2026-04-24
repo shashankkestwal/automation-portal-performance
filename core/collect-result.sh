@@ -46,7 +46,21 @@ TMP_DIR=$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "${T
 mkdir -p "${TMP_DIR}"
 
 SCENARIO="${SCENARIO:-mvp}"
+set +u
+set -a
+[[ -f "${REPO_ROOT}/test.env" ]] && source "${REPO_ROOT}/test.env"
+[[ -f "${TMP_DIR}/test.env" ]] && source "${TMP_DIR}/test.env"
+set +a
+set -u
+SCENARIO="${SCENARIO:-mvp}"
 export SCENARIO
+
+PORTAL_NAMESPACE="${PORTAL_NAMESPACE:-${SELF_SERVICE_PORTAL_NAMESPACE:-${NAMESPACE:-self-service-portal}}}"
+export PORTAL_NAMESPACE
+LOCUST_NAMESPACE="${LOCUST_NAMESPACE:-locust-operator}"
+export LOCUST_NAMESPACE
+
+fw_echo "Prometheus portal namespace (pod metrics): ${PORTAL_NAMESPACE}"
 
 cli="oc"
 

@@ -1,3 +1,10 @@
+# Portal pod/resource metrics via Thanos/Prometheus. Requires label selectors that match YOUR namespace
+# and pod names; if the PromQL returns no series (empty matrix), status_data.py logs a WARNING and does
+# not add measurements.* to benchmark.json. Align namespace_regex / pod_regex with `oc get pods -n …`.
+#
+# Default namespace: self-service-portal (see test.env PORTAL_NAMESPACE). App pods typically match the
+# Helm release (rhaap-portal-* or redhat-rhaap-portal-*); DB often *postgresql* or *psql*.
+
 {% macro monitor_pod(alias, namespace_regex, pod_regex, step=15, pod_suffix_regex='-[0-9a-f]+-.*') -%}
 - name: measurements.{{ alias }}.cpu
   monitoring_query: sum(pod:container_cpu_usage:sum{namespace=~'{{ namespace_regex }}', pod=~'{{ pod_regex }}{{ pod_suffix_regex }}'})
@@ -22,8 +29,8 @@
   monitoring_step: {{ step }}
 {%- endmacro %}
 
-{{ monitor_pod('automation_platform-app', 'skestwal-ssp', 'ssap-.*', 15, '-.*') }}
-{{ monitor_pod('automation_platform-postgres', 'skestwal-ssp', 'ssap-(postgresql|psql)', 15, '-.*') }}
+{{ monitor_pod('automation_platform-app', PORTAL_NAMESPACE | default('self-service-portal', true), '.*(redhat-rhaap-portal|rhaap-portal).*', 15, '-.*') }}
+{{ monitor_pod('automation_platform-postgres', PORTAL_NAMESPACE | default('self-service-portal', true), '.*(postgresql|psql).*', 15, '-.*') }}
 
 {%macro results_scenario(name) -%}
 - name: results.{{name}}.locust_requests_avg_response_time

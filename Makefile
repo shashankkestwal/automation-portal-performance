@@ -18,6 +18,10 @@ export AAP_ROUTE ?= aap
 # Secret containing AAP admin password (data key: password)
 AAP_ADMIN_SECRET ?= $(AAP_ROUTE)-admin-password
 
+# Optional: AAP access token for Locust mvp (scaffolder secrets.aapToken); set in test.env
+AAP_ACCESS_TOKEN ?=
+export AAP_ACCESS_TOKEN
+
 # Number of locust worker pods (primary scaling knob)
 export WORKERS ?= 5
 
@@ -88,7 +92,9 @@ endif
 	@if [ -f test.env ]; then cp -f test.env $(TMP_DIR)/test.env && echo "Snapshotted test.env -> $(TMP_DIR)/test.env"; fi
 	@PORTAL_URL="https://$$(oc -n $(PORTAL_NAMESPACE) get route $(PORTAL_ROUTE) -o jsonpath='{.spec.host}')"; \
 	AAP_URL="https://$$(oc -n $(AAP_NAMESPACE) get route $(AAP_ROUTE) -o jsonpath='{.spec.host}')"; \
-	AAP_PASSWORD="$$(oc -n $(AAP_NAMESPACE) get secret $(AAP_ADMIN_SECRET) -o jsonpath='{.data.password}' | base64 -d)"; \
+	AAP_PASSWORD="$$(oc -n $(AAP_NAMESPACE) get secret $(AAP_ADMIN_SECRET) -o jsonpath='{.data.password}' 2>/dev/null | base64 -d)"; \
+	[ -n "$$AAP_PASSWORD" ] || { echo "ERROR: empty admin password (secret $(AAP_ADMIN_SECRET) in $(AAP_NAMESPACE))" >&2; exit 1; }; \
+	export AAP_ACCESS_TOKEN_FLAG="$${AAP_ACCESS_TOKEN:+--aap-access-token $$AAP_ACCESS_TOKEN}"; \
 	export PORTAL_URL AAP_URL AAP_PASSWORD; \
 	echo "Portal URL: $$PORTAL_URL"; \
 	echo "AAP URL:    $$AAP_URL"; \
@@ -97,7 +103,7 @@ endif
 	kubectl create --namespace $(LOCUST_NAMESPACE) configmap locust.$(SCENARIO) --from-file $(TMP_DIR)/$(SCENARIO).py --dry-run=client -o yaml | kubectl apply --namespace $(LOCUST_NAMESPACE) -f -
 
 	@echo "Waiting for Locust operator to create the service..."
-	timeout=$$(python3 -c "from datetime import datetime, timedelta;t_add=int('60'); print(int((datetime.now() + timedelta(seconds=t_add)).timestamp()))"); while [ -z "$$(kubectl get --namespace $(LOCUST_NAMESPACE) svc $(SCENARIO)-test-master -o name 2>/dev/null)" ]; do if [ "$$(date "+%s")" -gt "$$timeout" ]; then echo "ERROR: Timeout waiting for service $(SCENARIO)-test-master"; exit 1; else echo "Waiting for service..."; sleep 2s; fi; done
+	@timeout=$$(python3 -c "from datetime import datetime, timedelta;t_add=int('60'); print(int((datetime.now() + timedelta(seconds=t_add)).timestamp()))"); while [ -z "$$(kubectl get --namespace $(LOCUST_NAMESPACE) svc $(SCENARIO)-test-master -o name 2>/dev/null)" ]; do if [ "$$(date "+%s")" -gt "$$timeout" ]; then echo "ERROR: Timeout waiting for service $(SCENARIO)-test-master"; exit 1; else echo "Waiting for service..."; sleep 2s; fi; done
 	@echo "Labeling the Locust service for Prometheus discovery..."
 	kubectl label --namespace $(LOCUST_NAMESPACE) svc $(SCENARIO)-test-master app=locust-test scenario=$(SCENARIO) --overwrite
 	envsubst < config/locust-metrics-service-template.yaml | kubectl apply --namespace $(LOCUST_NAMESPACE) -f -

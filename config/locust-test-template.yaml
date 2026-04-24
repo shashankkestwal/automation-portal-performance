@@ -14,17 +14,19 @@ spec:
       --run-time ${DURATION}
       --aap-url ${AAP_URL}
       --aap-password ${AAP_PASSWORD}
+      ${AAP_ACCESS_TOKEN_FLAG}
     extraArgs:
       - "--loglevel"
-      - "INFO"
+      - "DEBUG"
   worker:
     command: >-
       --locustfile /lotest/src/${SCENARIO}.py
       --aap-url ${AAP_URL}
       --aap-password ${AAP_PASSWORD}
+      ${AAP_ACCESS_TOKEN_FLAG}
     extraArgs:
       - "--loglevel"
-      - "INFO"
+      - "DEBUG"
     replicas: ${WORKERS}
   testFiles:
     configMapRef: locust.${SCENARIO}
