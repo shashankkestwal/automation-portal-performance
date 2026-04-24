@@ -2,13 +2,12 @@ import json
 import re
 import time
 import logging
-import uuid
 from urllib.parse import unquote
 
 import urllib3
 from locust import HttpUser, task, events
+from locust.exception import StopUser
 
-# Intentional: self.client.verify = False for OpenShift routes; silence per-request warnings.
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 logger = logging.getLogger(__name__)
@@ -44,12 +43,8 @@ def _extract_form_fields(html):
 
 
 def _extract_auth_data(html):
-    match = re.search(r"decodeURIComponent\('([^']+)'\)", html)
-    if not match:
-        return {}
-    try:
-        payload = json.loads(unquote(match.group(1)))
-        resp = payload.get("response", {})
+    def _from_payload(payload):
+        resp = payload.get("response", {}) if isinstance(payload, dict) else {}
         identity = resp.get("backstageIdentity", {}).get("identity", {})
         return {
             "token": resp.get("backstageIdentity", {}).get("token"),
@@ -57,8 +52,30 @@ def _extract_auth_data(html):
             "user_entity_ref": identity.get("userEntityRef", ""),
             "ownership_refs": identity.get("ownershipEntityRefs", []),
         }
-    except (json.JSONDecodeError, KeyError):
-        return {}
+
+    decoder = json.JSONDecoder()
+    for anchor in ("backstageIdentity", "\"backstageIdentity\"", "\"response\""):
+        idx = html.find(anchor)
+        if idx == -1:
+            continue
+        start = html.rfind("{", 0, idx)
+        if start == -1:
+            continue
+        # Try a handful of candidate starts (in case we picked the wrong '{')
+        for _ in range(5):
+            try:
+                payload, _end = decoder.raw_decode(html[start:])
+                data = _from_payload(payload)
+                if data.get("token") or data.get("aap_token"):
+                    return data
+            except json.JSONDecodeError:
+                pass
+            next_start = html.rfind("{", 0, start)
+            if next_start == -1 or next_start == start:
+                break
+            start = next_start
+
+    return {}
 
 class PortalUser(HttpUser):
 
@@ -72,10 +89,14 @@ class PortalUser(HttpUser):
         opts = self.environment.parsed_options
         self.aap_url = opts.aap_url
         self.aap_password = opts.aap_password
+        self._aap_access_token_cli = None
         self.template_namespace = TEMPLATE_NAMESPACE
         self.template_name = None
 
         self._do_initial_oauth()
+        if not self.token:
+            logger.error("OAuth did not yield a portal token; stopping user to avoid 4xx API calls")
+            raise StopUser()
 
     def _headers(self):
         h = {"X-Requested-With": "XMLHttpRequest"}
@@ -83,8 +104,10 @@ class PortalUser(HttpUser):
             h["Authorization"] = f"Bearer {self.token}"
         return h
 
-    def _get(self, path, name):
-        return self.client.get(path, headers=self._headers(), name=name)
+    def _get(self, path, name, params=None):
+        return self.client.get(
+            path, headers=self._headers(), name=name, params=params,
+        )
 
     def _post(self, path, name, json_body=None):
         return self.client.post(
@@ -205,7 +228,15 @@ class PortalUser(HttpUser):
                 raise RuntimeError("Callback failed")
             data = _extract_auth_data(resp.text)
             if not data.get("token"):
-                resp.failure("No token in callback")
+                content_type = (resp.headers.get("Content-Type") or "").split(";")[0].strip()
+                html = resp.text or ""
+                resp.failure(
+                    "No token in callback "
+                    f"(status={resp.status_code}, content_type={content_type}, "
+                    f"len={len(html)}, "
+                    f"has_decodeURIComponent={'decodeURIComponent' in html}, "
+                    f"has_backstageIdentity={'backstageIdentity' in html})"
+                )
                 raise RuntimeError("Token extraction failed")
             self.token = data["token"]
             self.aap_token = data.get("aap_token")
@@ -225,6 +256,10 @@ class PortalUser(HttpUser):
         ) as resp:
             if not resp.ok:
                 resp.failure(f"Refresh returned {resp.status_code}")
+                if resp.status_code in (401, 403):
+                    logger.warning("Token refresh unauthorized (%s); re-running OAuth to obtain a new token", resp.status_code)
+                    self._do_initial_oauth()
+                    return
                 logger.warning("Token refresh failed, keeping existing token")
                 return
             try:
@@ -262,54 +297,106 @@ class PortalUser(HttpUser):
                     templates = resp.json()
                     if templates and not self.template_name:
                         first = templates[0]
-                        self.template_name = first.get("metadata", {}).get("name")
-                        self.template_namespace = first.get("metadata", {}).get("namespace", TEMPLATE_NAMESPACE)
+                        metadata = first.get("metadata", {})
+                        self.template_name = metadata.get("name", "")
+                        self.template_namespace = metadata.get("namespace", TEMPLATE_NAMESPACE)
+                        has_aap_id = "aapJobTemplateId" in metadata
+                        logger.info("Selected scaffolder template: %s/%s (hasAapJobTemplateId=%s)",
+                                  self.template_namespace, self.template_name, has_aap_id)
                 except (json.JSONDecodeError, IndexError, KeyError):
                     logger.warning("Could not parse template list from catalog")
                 resp.success()
             else:
                 resp.failure(f"Catalog templates failed: {resp.status_code}")
 
-        self._get(
-            f"/api/catalog/entities/by-query?limit=0&filter=kind=template,relations.ownedBy={owner}",
-            "[catalog] GET /api/catalog/entities/by-query (owned)")
-        self._get(
+        with self.client.get(
             "/api/catalog/entities/by-query?limit=0&filter=kind=template",
-            "[catalog] GET /api/catalog/entities/by-query (all)")
+            headers=self._headers(),
+            name="[catalog] GET /api/catalog/entities/by-query (all)",
+            catch_response=True,
+        ) as resp:
+            if resp.ok:
+                if not self.template_name:
+                    try:
+                        body = resp.json()
+                        items = body.get("items") if isinstance(body, dict) else None
+                        if items:
+                            first = items[0]
+                            metadata = first.get("metadata", {})
+                            self.template_name = metadata.get("name", "")
+                            self.template_namespace = metadata.get("namespace", TEMPLATE_NAMESPACE)
+                            logger.info("Selected scaffolder template (by-query): %s/%s", self.template_namespace, self.template_name)
+                    except Exception:
+                        logger.warning("Could not parse template list from catalog by-query response")
+                resp.success()
+            else:
+                resp.failure(f"Catalog templates by-query failed: {resp.status_code}")
+
+        if not self.template_name:
+            logger.warning("No catalog template to run; scaffolder steps will be skipped")
 
     def _phase_sync(self):
         self._get(
-            "/api/catalog/aap/sync_status",
-            "[sync] GET /api/catalog/aap/sync_status")
+            "/api/catalog/ansible/sync/status",
+            "[sync] GET /api/catalog/ansible/sync/status",
+        )
         self._get(
-            "/api/catalog/aap/sync_orgs_users_teams",
-            "[sync] GET /api/catalog/aap/sync_orgs_users_teams")
+            "/api/catalog/ansible/sync/from-aap/orgs_users_teams",
+            "[sync] GET /api/catalog/ansible/sync/from-aap/orgs_users_teams",
+        )
         self._get(
-            "/api/catalog/aap/sync_job_templates",
-            "[sync] GET /api/catalog/aap/sync_job_templates")
+            "/api/catalog/ansible/sync/from-aap/job_templates",
+            "[sync] GET /api/catalog/ansible/sync/from-aap/job_templates",
+        )
 
     def _phase_scaffolder(self):
         if not self.template_name:
-            logger.error("Scaffolder: no template discovered from catalog, skipping")
+            logger.warning("No scaffolder template to run; scaffolder steps will be skipped")
             return
 
         ns = self.template_namespace
         name = self.template_name
 
+        with self.client.get(
+            f"/api/catalog/entities/by-name/template/{ns}/{name}",
+            headers=self._headers(),
+            name="[scaffolder] GET /api/catalog/entities/by-name/template/...",
+            catch_response=True,
+        ) as resp:
+            if resp.ok:
+                try:
+                    entity = resp.json()
+                    verified_name = entity.get("metadata", {}).get("name")
+                    verified_ns = entity.get("metadata", {}).get("namespace", ns)
+                    if verified_name:
+                        name = verified_name
+                        ns = verified_ns
+                        logger.info("Verified template: %s/%s", ns, name)
+                except Exception as e:
+                    logger.warning("Could not verify template name: %s", e)
+                resp.success()
+            else:
+                resp.failure(f"Template lookup failed: {resp.status_code}")
+
         self._get(
             f"/api/scaffolder/v2/templates/{ns}/template/{name}/parameter-schema",
             "[scaffolder] GET /api/scaffolder/v2/templates/.../parameter-schema")
-        self._get(
-            f"/api/catalog/entities/by-name/template/{ns}/{name}",
-            "[scaffolder] GET /api/catalog/entities/by-name/template/...")
 
-        id = str(uuid.uuid4())
+        logger.info("Scaffolder templateRef: template:%s/%s", ns, name)
         task_body = {
             "templateRef": f"template:{ns}/{name}",
-            "values": {
-                "token": id,
-            },
+            "values": {},
         }
+        if self.aap_token:
+            task_body["secrets"] = {"aapToken": self.aap_token}
+        else:
+            logger.warning(
+                "No AAP access token (OAuth callback providerInfo or --aap-access-token); "
+                "scaffolder may reject the task",
+            )
+
+        import json
+        logger.info("Task body being sent: %s", json.dumps(task_body, indent=2))
 
         with self.client.post(
             "/api/scaffolder/v2/tasks", headers=self._headers(), json=task_body,
@@ -320,36 +407,36 @@ class PortalUser(HttpUser):
                 task_id = resp.json().get("id")
                 resp.success()
             else:
-                resp.failure(f"Create task failed: {resp.status_code}")
+                detail = (resp.text or "")[:100]
+                resp.failure(
+                    f"Create task failed: {resp.status_code} {detail}",
+                )
                 task_id = None
 
         if task_id:
-            self._poll_task(task_id)
             self._get(
-                f"/api/scaffolder/v2/tasks/{task_id}/eventstream",
-                "[scaffolder] GET /api/scaffolder/v2/tasks/{id}/eventstream")
-        else:
-            logger.error("Scaffolder: task creation failed, skipping poll/stream")
+                f"/api/scaffolder/v2/tasks/{task_id}",
+                "[scaffolder] GET /api/scaffolder/v2/tasks/{id} (status)")
 
-        with self.client.post(
-            "/api/scaffolder/v2/tasks", headers=self._headers(), json=task_body,
-            name="[scaffolder] POST /api/scaffolder/v2/tasks (cancel-run)",
-            catch_response=True,
-        ) as resp:
-            if resp.ok:
-                task_id_2 = resp.json().get("id")
-                resp.success()
-            else:
-                resp.failure(f"Create task failed: {resp.status_code}")
-                task_id_2 = None
+        # with self.client.post(
+        #     "/api/scaffolder/v2/tasks", headers=self._headers(), json=task_body,
+        #     name="[scaffolder] POST /api/scaffolder/v2/tasks (cancel-run)",
+        #     catch_response=True,
+        # ) as resp:
+        #     if resp.ok:
+        #         task_id_2 = resp.json().get("id")
+        #         resp.success()
+        #     else:
+        #         detail = (resp.text or "")[:100]
+        #         resp.failure(
+        #             f"Create task failed: {resp.status_code} {detail}",
+        #         )
+        #         task_id_2 = None
 
         if task_id_2:
             self._get(
                 f"/api/scaffolder/v2/tasks/{task_id_2}",
-                "[scaffolder] GET /api/scaffolder/v2/tasks/{id} (status)")
-            self._get(
-                f"/api/scaffolder/v2/tasks/{task_id_2}/eventstream",
-                "[scaffolder] GET /api/scaffolder/v2/tasks/{id}/eventstream (cancel-run)")
+                "[scaffolder] GET /api/scaffolder/v2/tasks/{id} (cancel-run status)")
             self._post(
                 f"/api/scaffolder/v2/tasks/{task_id_2}/cancel",
                 "[scaffolder] POST /api/scaffolder/v2/tasks/{id}/cancel")
@@ -395,6 +482,6 @@ class PortalUser(HttpUser):
     def user_journey(self):
         self._phase_auth()
         self._phase_catalog()
-        self._phase_sync()
-        self._phase_scaffolder()
         self._phase_history()
+        self._phase_scaffolder()
+        self._phase_sync()

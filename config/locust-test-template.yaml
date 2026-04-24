@@ -14,7 +14,6 @@ spec:
       --run-time ${DURATION}
       --aap-url ${AAP_URL}
       --aap-password ${AAP_PASSWORD}
-      ${AAP_ACCESS_TOKEN_FLAG}
     extraArgs:
       - "--loglevel"
       - "DEBUG"
