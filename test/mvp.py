@@ -23,15 +23,6 @@ TEMPLATE_NAMESPACE = "default"
 def _(parser):
     parser.add_argument("--aap-url", type=str, default="", help="AAP gateway URL")
     parser.add_argument("--aap-password", type=str, default="", help="AAP admin password")
-    parser.add_argument(
-        "--aap-access-token",
-        type=str,
-        default="",
-        help=(
-            "AAP OAuth access token for scaffolder task secrets.aapToken "
-            "(backstage-rhaap-common); use when callback/refresh omit providerInfo"
-        ),
-    )
 
 def _extract_csrf_from_cookies(session):
     for cookie in session.cookies:
@@ -96,23 +87,6 @@ def _extract_auth_data(html):
             start = next_start
     return {}
 
-
-def _aap_token_from_api_body(body):
-    if not isinstance(body, dict):
-        return None
-    for key in ("response", "backstageIdentity"):
-        if key in body and isinstance(body[key], dict):
-            t = _aap_token_from_api_body(body[key])
-            if t:
-                return t
-    prov = body.get("providerInfo")
-    if isinstance(prov, dict):
-        at = prov.get("accessToken")
-        if at:
-            return at
-    return None
-
-
 class PortalUser(HttpUser):
 
     def on_start(self):
@@ -133,9 +107,6 @@ class PortalUser(HttpUser):
         if not self.token:
             logger.error("OAuth did not yield a portal token; stopping user to avoid 4xx API calls")
             raise StopUser()
-        cli = getattr(self.environment.parsed_options, "aap_access_token", None) or ""
-        if isinstance(cli, str) and cli.strip() and not self.aap_token:
-            self.aap_token = cli.strip()
         self._last_portal_refresh_at = time.time()
 
     def _headers(self):
@@ -168,7 +139,7 @@ class PortalUser(HttpUser):
     def _oauth_start(self):
         with self.client.get(
             "/api/auth/rhaap/start",
-            params={"env": "production", "scope": "read",
+            params={"env": "production", "scope": "read write",
                     "flow": "popup", "origin": self.host},
             allow_redirects=False,
             name="[auth] GET /api/auth/rhaap/start",
@@ -328,9 +299,6 @@ class PortalUser(HttpUser):
                     new_token = bs.get("token") if isinstance(bs, dict) else None
                     if new_token:
                         self.token = new_token
-                    new_aap_token = _aap_token_from_api_body(body) or _aap_token_from_api_body(bs)
-                    if new_aap_token:
-                        self.aap_token = new_aap_token
                     ident = bs.get("identity", {}) if isinstance(bs, dict) else {}
                     ref = ident.get("userEntityRef", "")
                     if ref:
