@@ -2,7 +2,7 @@ import json
 import re
 import time
 import logging
-from urllib.parse import unquote
+from urllib.parse import unquote, unquote_plus
 
 import urllib3
 from locust import HttpUser, task, events
@@ -13,8 +13,8 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 logger = logging.getLogger(__name__)
 
 AAP_USERNAME = "admin"
-TASK_POLL_INTERVAL = 5
-TASK_POLL_MAX_WAIT = 300
+
+PORTAL_TOKEN_REFRESH_INTERVAL_SECONDS = 60
 
 
 TEMPLATE_NAMESPACE = "default"
@@ -23,6 +23,15 @@ TEMPLATE_NAMESPACE = "default"
 def _(parser):
     parser.add_argument("--aap-url", type=str, default="", help="AAP gateway URL")
     parser.add_argument("--aap-password", type=str, default="", help="AAP admin password")
+    parser.add_argument(
+        "--aap-access-token",
+        type=str,
+        default="",
+        help=(
+            "AAP OAuth access token for scaffolder task secrets.aapToken "
+            "(backstage-rhaap-common); use when callback/refresh omit providerInfo"
+        ),
+    )
 
 def _extract_csrf_from_cookies(session):
     for cookie in session.cookies:
@@ -53,6 +62,18 @@ def _extract_auth_data(html):
             "ownership_refs": identity.get("ownershipEntityRefs", []),
         }
 
+    for pattern in (r"decodeURIComponent\('([^']*)'\)", r'decodeURIComponent\("([^"]*)"\)'):
+        for m in re.finditer(pattern, html):
+            raw = m.group(1)
+            for ufn in (unquote, unquote_plus):
+                try:
+                    payload = json.loads(ufn(raw))
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    continue
+                data = _from_payload(payload)
+                if data.get("token") or data.get("aap_token"):
+                    return data
+
     decoder = json.JSONDecoder()
     for anchor in ("backstageIdentity", "\"backstageIdentity\"", "\"response\""):
         idx = html.find(anchor)
@@ -61,7 +82,6 @@ def _extract_auth_data(html):
         start = html.rfind("{", 0, idx)
         if start == -1:
             continue
-        # Try a handful of candidate starts (in case we picked the wrong '{')
         for _ in range(5):
             try:
                 payload, _end = decoder.raw_decode(html[start:])
@@ -74,14 +94,31 @@ def _extract_auth_data(html):
             if next_start == -1 or next_start == start:
                 break
             start = next_start
-
     return {}
+
+
+def _aap_token_from_api_body(body):
+    if not isinstance(body, dict):
+        return None
+    for key in ("response", "backstageIdentity"):
+        if key in body and isinstance(body[key], dict):
+            t = _aap_token_from_api_body(body[key])
+            if t:
+                return t
+    prov = body.get("providerInfo")
+    if isinstance(prov, dict):
+        at = prov.get("accessToken")
+        if at:
+            return at
+    return None
+
 
 class PortalUser(HttpUser):
 
     def on_start(self):
         self.client.verify = False
         self.token = None
+        self._last_portal_refresh_at = 0.0
         self.aap_token = None
         self.username = None
         self.owner_ref = None
@@ -89,7 +126,6 @@ class PortalUser(HttpUser):
         opts = self.environment.parsed_options
         self.aap_url = opts.aap_url
         self.aap_password = opts.aap_password
-        self._aap_access_token_cli = None
         self.template_namespace = TEMPLATE_NAMESPACE
         self.template_name = None
 
@@ -97,6 +133,10 @@ class PortalUser(HttpUser):
         if not self.token:
             logger.error("OAuth did not yield a portal token; stopping user to avoid 4xx API calls")
             raise StopUser()
+        cli = getattr(self.environment.parsed_options, "aap_access_token", None) or ""
+        if isinstance(cli, str) and cli.strip() and not self.aap_token:
+            self.aap_token = cli.strip()
+        self._last_portal_refresh_at = time.time()
 
     def _headers(self):
         h = {"X-Requested-With": "XMLHttpRequest"}
@@ -226,10 +266,11 @@ class PortalUser(HttpUser):
             if resp.status_code >= 400:
                 resp.failure(f"Callback failed: {resp.status_code}")
                 raise RuntimeError("Callback failed")
+            content_type = (resp.headers.get("Content-Type") or "").split(";")[0].strip()
+            html = resp.text or ""
             data = _extract_auth_data(resp.text)
+
             if not data.get("token"):
-                content_type = (resp.headers.get("Content-Type") or "").split(";")[0].strip()
-                html = resp.text or ""
                 resp.failure(
                     "No token in callback "
                     f"(status={resp.status_code}, content_type={content_type}, "
@@ -247,41 +288,64 @@ class PortalUser(HttpUser):
             resp.success()
 
     def _phase_auth(self):
-        with self.client.get(
-            "/api/auth/rhaap/refresh",
-            params={"env": "production"},
-            headers=self._headers(),
-            name="[auth] GET /api/auth/rhaap/refresh",
-            catch_response=True,
-        ) as resp:
-            if not resp.ok:
-                resp.failure(f"Refresh returned {resp.status_code}")
-                if resp.status_code in (401, 403):
-                    logger.warning("Token refresh unauthorized (%s); re-running OAuth to obtain a new token", resp.status_code)
-                    self._do_initial_oauth()
+        """
+        Refresh the portal token to keep long tests authenticated.
+        Policy:
+        - 401/403 => stop the user
+        - 5xx => retry once, then stop the user
+        - any other non-2xx => stop the user
+        """
+
+        for attempt in (1, 2):
+            name = "[auth] GET /api/auth/rhaap/refresh" if attempt == 1 else "[auth] GET /api/auth/rhaap/refresh (retry)"
+            with self.client.get(
+                "/api/auth/rhaap/refresh",
+                params={"env": "production"},
+                headers=self._headers(),
+                name=name,
+                catch_response=True,
+            ) as resp:
+                status = resp.status_code
+
+                if status in (401, 403):
+                    resp.failure(f"Refresh unauthorized ({status}); stopping user")
+                    raise StopUser()
+
+                if 500 <= status <= 599:
+                    if attempt == 1:
+                        resp.failure(f"Refresh server error ({status}); retrying once")
+                        continue
+                    resp.failure(f"Refresh server error ({status}); stopping user")
+                    raise StopUser()
+
+                if not resp.ok:
+                    resp.failure(f"Refresh failed ({status}); stopping user")
+                    raise StopUser()
+
+                try:
+                    body = resp.json()
+                    bs = body.get("backstageIdentity", {}) if isinstance(body, dict) else {}
+                    new_token = bs.get("token") if isinstance(bs, dict) else None
+                    if new_token:
+                        self.token = new_token
+                    new_aap_token = _aap_token_from_api_body(body) or _aap_token_from_api_body(bs)
+                    if new_aap_token:
+                        self.aap_token = new_aap_token
+                    ident = bs.get("identity", {}) if isinstance(bs, dict) else {}
+                    ref = ident.get("userEntityRef", "")
+                    if ref:
+                        self.username = ref.split("/")[-1]
+                    refs = ident.get("ownershipEntityRefs", [])
+                    if refs:
+                        self.owner_ref = refs[0]
+                    self._last_portal_refresh_at = time.time()
+                    resp.success()
                     return
-                logger.warning("Token refresh failed, keeping existing token")
-                return
-            try:
-                body = resp.json()
-                bs = body.get("backstageIdentity", {})
-                new_token = bs.get("token")
-                if new_token:
-                    self.token = new_token
-                ident = bs.get("identity", {})
-                ref = ident.get("userEntityRef", "")
-                if ref:
-                    self.username = ref.split("/")[-1]
-                refs = ident.get("ownershipEntityRefs", [])
-                if refs:
-                    self.owner_ref = refs[0]
-                resp.success()
-            except Exception as exc:
-                resp.failure(f"Parse error: {exc}")
+                except Exception as exc:
+                    resp.failure(f"Refresh parse error: {exc}; stopping user")
+                    raise StopUser()
 
     def _phase_catalog(self):
-        owner = self.owner_ref or "user:default/unknown"
-
         self._get(
             "/api/catalog/entity-facets?facet=*",
             "[catalog] GET /api/catalog/entity-facets")
@@ -300,9 +364,6 @@ class PortalUser(HttpUser):
                         metadata = first.get("metadata", {})
                         self.template_name = metadata.get("name", "")
                         self.template_namespace = metadata.get("namespace", TEMPLATE_NAMESPACE)
-                        has_aap_id = "aapJobTemplateId" in metadata
-                        logger.info("Selected scaffolder template: %s/%s (hasAapJobTemplateId=%s)",
-                                  self.template_namespace, self.template_name, has_aap_id)
                 except (json.JSONDecodeError, IndexError, KeyError):
                     logger.warning("Could not parse template list from catalog")
                 resp.success()
@@ -325,7 +386,6 @@ class PortalUser(HttpUser):
                             metadata = first.get("metadata", {})
                             self.template_name = metadata.get("name", "")
                             self.template_namespace = metadata.get("namespace", TEMPLATE_NAMESPACE)
-                            logger.info("Selected scaffolder template (by-query): %s/%s", self.template_namespace, self.template_name)
                     except Exception:
                         logger.warning("Could not parse template list from catalog by-query response")
                 resp.success()
@@ -356,47 +416,9 @@ class PortalUser(HttpUser):
 
         ns = self.template_namespace
         name = self.template_name
-
-        with self.client.get(
-            f"/api/catalog/entities/by-name/template/{ns}/{name}",
-            headers=self._headers(),
-            name="[scaffolder] GET /api/catalog/entities/by-name/template/...",
-            catch_response=True,
-        ) as resp:
-            if resp.ok:
-                try:
-                    entity = resp.json()
-                    verified_name = entity.get("metadata", {}).get("name")
-                    verified_ns = entity.get("metadata", {}).get("namespace", ns)
-                    if verified_name:
-                        name = verified_name
-                        ns = verified_ns
-                        logger.info("Verified template: %s/%s", ns, name)
-                except Exception as e:
-                    logger.warning("Could not verify template name: %s", e)
-                resp.success()
-            else:
-                resp.failure(f"Template lookup failed: {resp.status_code}")
-
-        self._get(
-            f"/api/scaffolder/v2/templates/{ns}/template/{name}/parameter-schema",
-            "[scaffolder] GET /api/scaffolder/v2/templates/.../parameter-schema")
-
-        logger.info("Scaffolder templateRef: template:%s/%s", ns, name)
-        task_body = {
-            "templateRef": f"template:{ns}/{name}",
-            "values": {},
-        }
+        task_body = {"templateRef": f"template:{ns}/{name}", "values": {}}
         if self.aap_token:
             task_body["secrets"] = {"aapToken": self.aap_token}
-        else:
-            logger.warning(
-                "No AAP access token (OAuth callback providerInfo or --aap-access-token); "
-                "scaffolder may reject the task",
-            )
-
-        import json
-        logger.info("Task body being sent: %s", json.dumps(task_body, indent=2))
 
         with self.client.post(
             "/api/scaffolder/v2/tasks", headers=self._headers(), json=task_body,
@@ -433,15 +455,15 @@ class PortalUser(HttpUser):
         #         )
         #         task_id_2 = None
 
-        if task_id_2:
-            self._get(
-                f"/api/scaffolder/v2/tasks/{task_id_2}",
-                "[scaffolder] GET /api/scaffolder/v2/tasks/{id} (cancel-run status)")
-            self._post(
-                f"/api/scaffolder/v2/tasks/{task_id_2}/cancel",
-                "[scaffolder] POST /api/scaffolder/v2/tasks/{id}/cancel")
-        else:
-            logger.error("Scaffolder: cancel-run task creation failed, skipping")
+        # if task_id_2:
+        #     self._get(
+        #         f"/api/scaffolder/v2/tasks/{task_id_2}",
+        #         "[scaffolder] GET /api/scaffolder/v2/tasks/{id} (cancel-run status)")
+        #     self._post(
+        #         f"/api/scaffolder/v2/tasks/{task_id_2}/cancel",
+        #         "[scaffolder] POST /api/scaffolder/v2/tasks/{id}/cancel")
+        # else:
+        #     logger.error("Scaffolder: cancel-run task creation failed, skipping")
 
     def _phase_history(self):
         user = self.username or "unknown"
@@ -456,32 +478,18 @@ class PortalUser(HttpUser):
             f"/api/scaffolder/v2/tasks?createdBy=user:default/{user}&limit=10&offset=10",
             "[history] GET /api/scaffolder/v2/tasks (page 2)")
 
-
-    def _poll_task(self, task_id):
-        deadline = time.time() + TASK_POLL_MAX_WAIT
-        while time.time() < deadline:
-            with self.client.get(
-                f"/api/scaffolder/v2/tasks/{task_id}",
-                headers=self._headers(),
-                name="[scaffolder] GET /api/scaffolder/v2/tasks/{id} (poll)",
-                catch_response=True,
-            ) as resp:
-                if resp.ok:
-                    status = resp.json().get("status", "")
-                    resp.success()
-                    if status in ("completed", "failed", "cancelled"):
-                        return status
-                else:
-                    resp.failure(f"Poll failed: {resp.status_code}")
-                    return None
-            time.sleep(TASK_POLL_INTERVAL)
-        logger.warning("Task %s timed out after %ds", task_id, TASK_POLL_MAX_WAIT)
-        return "timeout"
-
-    @task
+    # Locust samples tasks by weight. 10:1 => ten "journey" iterations per one
+    # "scaffolder" iteration on average (not 10:1 per HTTP name).
+    @task(5)
     def user_journey(self):
         self._phase_auth()
         self._phase_catalog()
         self._phase_history()
-        self._phase_scaffolder()
         self._phase_sync()
+
+    @task(1)
+    def scaffold_task(self):
+        self._phase_auth()
+        if not self.template_name:
+            self._phase_catalog()
+        self._phase_scaffolder()

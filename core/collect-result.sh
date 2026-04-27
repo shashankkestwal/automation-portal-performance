@@ -85,6 +85,43 @@ try_gather_dir() {
     fi
 }
 
+# Current logs from the locust master pod (if it still exists in the cluster).
+gather_locust_master_logs() {
+	local kcmd
+	if command -v kubectl &>/dev/null; then
+		kcmd=kubectl
+	elif command -v oc &>/dev/null; then
+		kcmd=oc
+	else
+		fw_warn "kubectl/oc not on PATH; skipping locust master pod log capture"
+		return 0
+	fi
+
+	local out="${ARTIFACT_DIR}/locust-master.log"
+	local label_sel="performance-test-pod-name=${SCENARIO}-test-master"
+	local podline
+	if ! $kcmd get "namespace" "${LOCUST_NAMESPACE}" &>/dev/null; then
+		fw_warn "Namespace ${LOCUST_NAMESPACE} not found; skipping locust master log"
+		return 0
+	fi
+	podline="$($kcmd get pod -n "${LOCUST_NAMESPACE}" -l "${label_sel}" -o name 2>/dev/null | head -1 || true)"
+	if [[ -z "$podline" ]]; then
+		{
+			echo "No locust master pod at collection time (label ${label_sel} in ${LOCUST_NAMESPACE})."
+			echo "The locust operator may have removed the pod after the test finished."
+			echo "If you ran 'make test', a stream was also saved to load-test.log in this artifact when present."
+		} >"$out"
+		fw_warn "No locust master pod found; wrote placeholder to $(basename "$out")"
+		return 0
+	fi
+
+	fw_echo "Capturing locust master pod logs: ${podline#pod/} -> ${out##*/}"
+	# --all-containers: master may run sidecars depending on operator image
+	$kcmd logs -n "${LOCUST_NAMESPACE}" "${podline}" --all-containers=true > "${out}" 2>&1 || {
+		fw_warn "locust master pod log read failed (content in ${out} if any was written by kubectl)"
+	}
+}
+
 try_gather_file "${TMP_DIR}/benchmark-before"
 try_gather_file "${TMP_DIR}/benchmark-after"
 try_gather_file "${TMP_DIR}/benchmark-scenario"
@@ -93,6 +130,9 @@ try_gather_file "${TMP_DIR}/locust-test.yaml"
 if [[ -f "${TMP_DIR}/test.env" ]]; then
 	try_gather_file "${TMP_DIR}/test.env"
 fi
+try_gather_file "${TMP_DIR}/load-test.log"
+
+gather_locust_master_logs
 # Metrics
 PYTHON_VENV_DIR="${REPO_ROOT}/.venv"
 
