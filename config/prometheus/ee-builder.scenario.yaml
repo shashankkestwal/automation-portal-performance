@@ -1,0 +1,51 @@
+# Locust metrics for SCENARIO=ee-builder-new (test/ee-builder-new.py).
+#
+# Locust request names start with a bracketed prefix; PromQL matches via RE2 literal brackets:
+#   name=~"[[]prefix[]].*"   (see results_scenario macro below).
+#
+# Prefix scheme (eb = ee-builder scenario):
+#   [auth]                              OAuth / refresh (unchanged)
+#   [eb.catalog.facets]                 entity-facets
+#   [eb.catalog.templates]              EE template list / counts
+#   [eb.catalog.template_entity]        template entity by name
+#   [eb.catalog.collections]            ansible-collection components + by-query for EE
+#   [eb.catalog.components]               all components + ansible-tagged count
+#   [eb.catalog.git]                      git-repository list + detail
+#   [eb.other.ansible_ci]               GET …/catalog/ansible/git/ci-activity
+#   [eb.scaffolder.template]            GET …/parameter-schema
+#   [eb.scaffolder.autocomplete.search]   POST autocomplete (when enabled)
+#   [eb.scaffolder.autocomplete.list]     POST autocomplete list phase (when enabled)
+#   [eb.scaffolder.tasks]               POST create EE task (when enabled)
+#
+# Metric keys use dots→underscores: results.eb_catalog_git.locust_requests_*
+#
+- name: total_requests
+  monitoring_query: sum(locust_requests_num_requests{namespace="{{ LOCUST_NAMESPACE }}", job="{{ SCENARIO }}-test-master"})
+  monitoring_step: 15
+{%macro results_scenario(name) -%}
+- name: results.{{ name | replace('-', '_') | replace('.', '_') }}.locust_requests_avg_response_time
+  monitoring_query: max(locust_requests_avg_response_time{name=~"[[]{{name}}[]].*", namespace="{{ LOCUST_NAMESPACE }}", job="{{ SCENARIO }}-test-master"})
+  monitoring_step: 15
+- name: results.{{ name | replace('-', '_') | replace('.', '_') }}.locust_requests_current_rps
+  monitoring_query: max(locust_requests_current_rps{name=~"[[]{{name}}[]].*", namespace="{{ LOCUST_NAMESPACE }}", job="{{ SCENARIO }}-test-master"})
+  monitoring_step: 15
+- name: results.{{ name | replace('-', '_') | replace('.', '_') }}.locust_requests_num_failures
+  monitoring_query: sum(locust_requests_num_failures{name=~"[[]{{name}}[]].*", namespace="{{ LOCUST_NAMESPACE }}", job="{{ SCENARIO }}-test-master"})
+  monitoring_step: 15
+- name: results.{{ name | replace('-', '_') | replace('.', '_') }}.locust_requests_avg_content_length
+  monitoring_query: max(locust_requests_avg_content_length{name=~"[[]{{name}}[]].*", namespace="{{ LOCUST_NAMESPACE }}", job="{{ SCENARIO }}-test-master"})
+  monitoring_step: 15
+{%- endmacro %}
+
+{{ results_scenario('auth') }}
+{{ results_scenario('eb.catalog.facets') }}
+{{ results_scenario('eb.catalog.templates') }}
+{{ results_scenario('eb.catalog.template_entity') }}
+{{ results_scenario('eb.catalog.collections') }}
+{{ results_scenario('eb.catalog.components') }}
+{{ results_scenario('eb.catalog.git') }}
+{{ results_scenario('eb.other.ansible_ci') }}
+{{ results_scenario('eb.scaffolder.template') }}
+{{ results_scenario('eb.scaffolder.autocomplete.search') }}
+{{ results_scenario('eb.scaffolder.autocomplete.list') }}
+{{ results_scenario('eb.scaffolder.tasks') }}
