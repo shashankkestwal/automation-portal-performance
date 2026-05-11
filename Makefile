@@ -22,6 +22,10 @@ AAP_ADMIN_SECRET ?= $(AAP_ROUTE)-admin-password
 AAP_ACCESS_TOKEN ?=
 export AAP_ACCESS_TOKEN
 
+# GitHub PAT for ee-builder SCM publish (secrets.USER_OAUTH_TOKEN); set in test.env when SCENARIO=ee-builder
+GITHUB_USER_OAUTH_TOKEN ?=
+export GITHUB_USER_OAUTH_TOKEN
+
 # Number of locust worker pods (primary scaling knob)
 export WORKERS ?= 5
 
@@ -29,6 +33,8 @@ export WORKERS ?= 5
 export USERS ?= 10
 export SPAWN_RATE ?= 2
 export DURATION ?= 10s
+# Passed to Locust as --scaffolder-task-status-delay-seconds (see config/locust-test-template.yaml)
+export SCAFFOLDER_TASK_STATUS_DELAY_SECONDS ?= 10
 export LOCUST_EXTRA_CMD ?= "--debug=true"
 
 # Locust operator
@@ -95,6 +101,7 @@ endif
 	AAP_PASSWORD="$$(oc -n $(AAP_NAMESPACE) get secret $(AAP_ADMIN_SECRET) -o jsonpath='{.data.password}' 2>/dev/null | base64 -d)"; \
 	[ -n "$$AAP_PASSWORD" ] || { echo "ERROR: empty admin password (secret $(AAP_ADMIN_SECRET) in $(AAP_NAMESPACE))" >&2; exit 1; }; \
 	export AAP_ACCESS_TOKEN_FLAG="$${AAP_ACCESS_TOKEN:+--aap-access-token $$AAP_ACCESS_TOKEN}"; \
+	export GITHUB_USER_OAUTH_TOKEN_FLAG="$${GITHUB_USER_OAUTH_TOKEN:+--github-user-oauth-token $$GITHUB_USER_OAUTH_TOKEN}"; \
 	export PORTAL_URL AAP_URL AAP_PASSWORD; \
 	echo "Portal URL: $$PORTAL_URL"; \
 	echo "AAP URL:    $$AAP_URL"; \
