@@ -1,4 +1,4 @@
-# Locust metrics for SCENARIO=ee-builder-new (test/ee-builder-new.py).
+# Locust metrics for SCENARIO=ee-builder (test/ee-builder.py).
 
 - name: total_requests
   monitoring_query: sum(locust_requests_num_requests{namespace="{{ LOCUST_NAMESPACE }}", job="{{ SCENARIO }}-test-master"})
@@ -22,9 +22,9 @@
 {{ results_scenario('eb.catalog.ee_defs') }}
 {{ results_scenario('eb.catalog.templates') }}
 {{ results_scenario('eb.catalog.collections') }}
-{{ results_scenario('eb.catalog.components') }}
 {{ results_scenario('eb.catalog.git') }}
+{{ results_scenario('eb.catalog.ee_definition') }}
 {{ results_scenario('eb.scaffolder.template') }}
-{{ results_scenario('eb.scaffolder.autocomplete.search') }}
 {{ results_scenario('eb.scaffolder.autocomplete.list') }}
 {{ results_scenario('eb.scaffolder.tasks') }}
+{{ results_scenario('eb.scm.github') }}

@@ -35,6 +35,13 @@ export SPAWN_RATE ?= 2
 export DURATION ?= 10s
 # Passed to Locust as --scaffolder-task-status-delay-seconds (see config/locust-test-template.yaml)
 export SCAFFOLDER_TASK_STATUS_DELAY_SECONDS ?= 10
+# ee-builder only: passed to Locust as --scm-github-verify-delay-seconds when SCENARIO=ee-builder
+export SCM_GITHUB_VERIFY_DELAY_SECONDS ?= 10
+SCM_GITHUB_LOCUST_CMD :=
+ifeq ($(SCENARIO),ee-builder)
+SCM_GITHUB_LOCUST_CMD := --scm-github-verify-delay-seconds $(SCM_GITHUB_VERIFY_DELAY_SECONDS)
+endif
+export SCM_GITHUB_LOCUST_CMD
 export LOCUST_EXTRA_CMD ?= "--debug=true"
 
 # Locust operator
