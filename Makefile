@@ -15,6 +15,9 @@ export AAP_NAMESPACE ?= ansible-automation-platform
 export PORTAL_ROUTE ?= sap
 export AAP_ROUTE ?= aap
 
+
+export AAP_PASSWORD ?= redhat123
+
 # Secret containing AAP admin password (data key: password)
 AAP_ADMIN_SECRET ?= $(AAP_ROUTE)-admin-password
 
@@ -74,7 +77,7 @@ deploy-locust: namespace $(TMP_DIR)
 	helm repo add $(LOCUST_OPERATOR_REPO) https://abdelrhmanhamouda.github.io/locust-k8s-operator/ --force-update --namespace $(LOCUST_NAMESPACE)
 	@if ! helm list --namespace $(LOCUST_NAMESPACE) | grep -q "$(LOCUST_OPERATOR)"; then \
 		envsubst < ./config/locust-k8s-operator.values.yaml > $(TMP_DIR)/locust-k8s-operator.values.yaml; \
-		helm install $(LOCUST_OPERATOR) locust-k8s-operator/locust-k8s-operator --namespace $(LOCUST_NAMESPACE) --values $(TMP_DIR)/locust-k8s-operator.values.yaml; \
+		helm upgrade --install $(LOCUST_OPERATOR) locust-k8s-operator/locust-k8s-operator --namespace $(LOCUST_NAMESPACE) --values $(TMP_DIR)/locust-k8s-operator.values.yaml; \
 	else \
 		echo "Helm release \"$(LOCUST_OPERATOR)\" already exists"; \
 	fi
@@ -105,7 +108,9 @@ endif
 	@if [ -f test.env ]; then cp -f test.env $(TMP_DIR)/test.env && echo "Snapshotted test.env -> $(TMP_DIR)/test.env"; fi
 	@PORTAL_URL="https://$$(oc -n $(PORTAL_NAMESPACE) get route $(PORTAL_ROUTE) -o jsonpath='{.spec.host}')"; \
 	AAP_URL="https://$$(oc -n $(AAP_NAMESPACE) get route $(AAP_ROUTE) -o jsonpath='{.spec.host}')"; \
-	AAP_PASSWORD="$$(oc -n $(AAP_NAMESPACE) get secret $(AAP_ADMIN_SECRET) -o jsonpath='{.data.password}' 2>/dev/null | base64 -d)"; \
+	if [ "$(SCENARIO)" != "ee-builder" ]; then \
+		AAP_PASSWORD="$$(oc -n $(AAP_NAMESPACE) get secret $(AAP_ADMIN_SECRET) -o jsonpath='{.data.password}' 2>/dev/null | base64 -d)"; \
+	fi; \
 	[ -n "$$AAP_PASSWORD" ] || { echo "ERROR: empty admin password (secret $(AAP_ADMIN_SECRET) in $(AAP_NAMESPACE))" >&2; exit 1; }; \
 	export AAP_ACCESS_TOKEN_FLAG="$${AAP_ACCESS_TOKEN:+--aap-access-token $$AAP_ACCESS_TOKEN}"; \
 	export GITHUB_USER_OAUTH_TOKEN_FLAG="$${GITHUB_USER_OAUTH_TOKEN:+--github-user-oauth-token $$GITHUB_USER_OAUTH_TOKEN}"; \

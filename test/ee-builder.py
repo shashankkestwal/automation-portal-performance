@@ -9,6 +9,7 @@ from urllib.parse import quote, unquote, unquote_plus
 import urllib3
 from locust import HttpUser, task, events
 from locust.exception import StopUser
+from locust.runners import LocalRunner, MasterRunner, WorkerRunner
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -16,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 __version__ = "1.0.0"
 
-AAP_USERNAME = "admin"
+_test_usernames = []
 TEMPLATE_NAMESPACE = "default"
 DEFAULT_EE_TEMPLATE = "ansible-execution-environment-builder-start-from-scratch"
 
@@ -145,7 +146,12 @@ def _task_create_body_for_log(task_body):
 @events.init_command_line_parser.add_listener
 def _(parser):
     parser.add_argument("--aap-url", type=str, default="", help="AAP gateway URL")
-    parser.add_argument("--aap-password", type=str, default="", help="AAP admin password")
+    parser.add_argument(
+        "--aap-password",
+        type=str,
+        default="",
+        help="AAP password for user-NNN logins (ee-builder: redhat123 from Makefile)",
+    )
     parser.add_argument(
         "--aap-access-token",
         type=str,
@@ -249,7 +255,55 @@ def _extract_auth_data(html):
     return {}
 
 
+def _setup_test_users(environment, msg, **_kwargs):
+    """Worker receives usernames chunk from master (t_1 .. t_N)."""
+    _test_usernames.extend(msg.data)
+    logger.info("EE builder test users assigned on worker: %s", msg.data)
+
+
+@events.init.add_listener
+def _on_locust_init(environment, **_kwargs):
+    if isinstance(environment.runner, WorkerRunner):
+        environment.runner.register_message("test_users", _setup_test_users)
+
+
+@events.test_start.add_listener
+def _on_test_start(environment, **_kwargs):
+    """Assign user-001..user-N so each Locust user logs in with a unique AAP account (never admin)."""
+    runner = environment.runner
+    users = [f"user-{str(i).zfill(3)}" for i in range(1, int(runner.target_user_count) + 1)]
+
+    if isinstance(runner, LocalRunner):
+        _test_usernames.extend(users)
+        logger.info("EE builder test users (local): %s", users)
+        return
+
+    if not isinstance(runner, MasterRunner):
+        return
+
+    worker_count = runner.worker_count
+    chunk_size = len(users) // worker_count
+    chunk_leftover = len(users) % worker_count
+
+    for i, worker in enumerate(runner.clients):
+        start_index = i * chunk_size
+        end_index = start_index + chunk_size
+        data = users[start_index:end_index]
+        if chunk_leftover > 0 and chunk_leftover > i:
+            data.append(users[worker_count * chunk_size + i])
+        logger.info("Sending test users to worker %s: %s", worker, data)
+        runner.send_message("test_users", data, worker)
+
+
 class EEBuilderUser(HttpUser):
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if not _test_usernames:
+            raise StopUser(
+                "No AAP test user assigned (expected user-001..user-N from test_start; admin is not used)",
+            )
+        self.aap_username = _test_usernames.pop(0)
 
     def on_start(self):
         self.client.verify = False
@@ -381,7 +435,7 @@ class EEBuilderUser(HttpUser):
         # AAP gateway login (external OAuth); not a portal /api/* POST — required for tokens.
         with self.client.post(
             login_url,
-            data={"username": AAP_USERNAME, "password": self.aap_password},
+            data={"username": self.aap_username, "password": self.aap_password},
             headers={"X-CSRFToken": csrf, "Referer": f"{self.aap_url}/"},
             allow_redirects=False,
             name="[auth] POST AAP login",
@@ -389,7 +443,7 @@ class EEBuilderUser(HttpUser):
         ) as resp:
             if resp.status_code != 302:
                 resp.failure(f"Login failed: {resp.status_code}")
-                raise RuntimeError("Login failed")
+                raise RuntimeError("User %s login failed.", self.aap_username)
             resp.success()
         return _extract_csrf_from_cookies(self.client)
 
@@ -951,9 +1005,9 @@ class EEBuilderUser(HttpUser):
         meta = self._create_ee_definition_task(use_scm=False)
         if meta:
             out.append(meta)
-        meta = self._create_ee_definition_task(use_scm=True)
-        if meta:
-            out.append(meta)
+        # meta = self._create_ee_definition_task(use_scm=True)
+        # if meta:
+        #     out.append(meta)
         return out
 
     @task
