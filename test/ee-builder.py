@@ -22,8 +22,17 @@ TEMPLATE_NAMESPACE = "default"
 DEFAULT_EE_TEMPLATE = "ansible-execution-environment-builder-start-from-scratch"
 
 DEFAULT_BASE_IMAGE = "registry.redhat.io/ansible-automation-platform/ee-minimal-rhel8:2.18"
-COLLECTIONS_CATALOG_LIMIT = 200
+CATALOG_PROBE_LIMIT = 50
+CATALOG_PAGE_LIMIT = 200
 COLLECTIONS_PER_EE = 5
+
+CATALOG_FILTER_EE_DEFS = "kind%3DComponent%2Cspec.type%3Dexecution-environment"
+CATALOG_FILTER_COLLECTIONS = "kind%3DComponent%2Cspec.type%3Dansible-collection"
+CATALOG_FILTER_GIT = "kind%3DComponent%2Cspec.type%3Dgit-repository"
+CATALOG_PATH_EE_TEMPLATES = (
+    "/api/catalog/entities?filter=spec.type%3Dexecution-environment%2Ckind%3Dtemplate"
+    "&order=asc%3Ametadata.name"
+)
 
 # Catalog namespace for EE definition Component entities (see download_ee_definition.py).
 EE_DEFINITION_COMPONENT_NAMESPACE = "default"
@@ -43,13 +52,13 @@ SCM_GITHUB_VERIFY_DELAY_SECONDS = 10.0
 # EE_REGISTRY_TLS_VERIFY = True
 
 
-def _catalog_entities_list(body):
-    """Normalize catalog API response to a list of entities."""
-    if isinstance(body, list):
-        return body
-    if isinstance(body, dict):
-        return body.get("items") or []
-    return []
+def _catalog_by_query_page_count(total_items):
+    """Pages of limit=CATALOG_PAGE_LIMIT after the initial limit=CATALOG_PROBE_LIMIT probe."""
+    try:
+        total = int(total_items)
+    except (TypeError, ValueError):
+        return 0
+    return total // CATALOG_PAGE_LIMIT
 
 
 def _scaffolder_run_status_from_body(body):
@@ -103,31 +112,6 @@ def _parse_collection_names_from_autocomplete(body):
             out.append(n)
     return out
 
-
-def _parse_collection_names_from_autocomplete_results(body):
-    """
-    Extract collection names from POST …/autocomplete/aap-api-cloud/collections response.
-    Primary shape: results[].name (portal / browser).
-    Falls back to _parse_collection_names_from_autocomplete for other shapes.
-    """
-    names = []
-    if isinstance(body, dict):
-        results = body.get("results")
-        if isinstance(results, list):
-            for item in results:
-                if isinstance(item, dict):
-                    n = item.get("name")
-                    if isinstance(n, str) and n.strip():
-                        names.append(n.strip())
-    if names:
-        seen = set()
-        out = []
-        for n in names:
-            if n not in seen:
-                seen.add(n)
-                out.append(n)
-        return out
-    return _parse_collection_names_from_autocomplete(body)
 
 
 def _task_create_body_for_log(task_body):
@@ -311,7 +295,6 @@ class EEBuilderUser(HttpUser):
         self.aap_token = None
         self.username = None
         self.owner_ref = None
-        self.available_collections = []
 
         opts = self.environment.parsed_options
         self.aap_url = opts.aap_url
@@ -344,7 +327,8 @@ class EEBuilderUser(HttpUser):
         """Headers aligned with browser POSTs (curl): JSON body + Origin + Referer."""
         h = self._headers()
         h["Content-Type"] = "application/json"
-        h["Accept"] = "application/json"
+        # Browser scaffolder POST uses Accept: */* (see non-SCM EE create curl).
+        h["Accept"] = "*/*"
         host = getattr(self, "host", None)
         if host:
             base = host.rstrip("/")
@@ -375,8 +359,50 @@ class EEBuilderUser(HttpUser):
         kwargs.update(extra)
         return self.client.post(path, **kwargs)
 
+    def _catalog_by_query_paginated(self, filter_param, name):
+        probe_first_name = None
+        total_items = 0
+        probe_path = (
+            f"/api/catalog/entities/by-query?limit={CATALOG_PROBE_LIMIT}&offset=0"
+            f"&filter={filter_param}"
+        )
+        with self._get(probe_path, f"{name}", catch_response=True) as resp:
+            if not resp.ok:
+                resp.failure(f"Catalog probe failed: {resp.status_code}")
+                return None
+            try:
+                body = resp.json()
+                total_items = body.get("totalItems", 0)
+                items = body.get("items") or []
+                if items:
+                    probe_first_name = (items[0].get("metadata") or {}).get("name")
+                resp.success()
+            except Exception as exc:
+                resp.failure(f"Catalog probe parse error: {exc}")
+                return None
+
+        for page_idx in range(_catalog_by_query_page_count(total_items)):
+            offset = page_idx * CATALOG_PAGE_LIMIT + CATALOG_PROBE_LIMIT
+            page_path = (
+                f"/api/catalog/entities/by-query?limit={CATALOG_PAGE_LIMIT}&offset={offset}"
+                f"&filter={filter_param}"
+            )
+            with self._get(
+                page_path,
+                name=name,
+                catch_response=True,
+            ) as resp:
+                if not resp.ok:
+                    resp.failure(f"Catalog page failed: {resp.status_code}")
+                    continue
+                try:
+                    resp.json()
+                    resp.success()
+                except Exception as exc:
+                    resp.failure(f"Catalog page parse error: {exc}")
+        return probe_first_name
+
     def _do_initial_oauth(self):
-        """Complete OAuth flow with AAP."""
         self.client.cookies.clear()
         try:
             auth_url, nonce = self._oauth_start()
@@ -432,7 +458,6 @@ class EEBuilderUser(HttpUser):
         csrf = _extract_csrf_from_cookies(self.client)
         if not csrf:
             raise RuntimeError("No CSRF token")
-        # AAP gateway login (external OAuth); not a portal /api/* POST — required for tokens.
         with self.client.post(
             login_url,
             data={"username": self.aap_username, "password": self.aap_password},
@@ -443,7 +468,7 @@ class EEBuilderUser(HttpUser):
         ) as resp:
             if resp.status_code != 302:
                 resp.failure(f"Login failed: {resp.status_code}")
-                raise RuntimeError("User %s login failed.", self.aap_username)
+                raise RuntimeError("Login failed")
             resp.success()
         return _extract_csrf_from_cookies(self.client)
 
@@ -465,7 +490,6 @@ class EEBuilderUser(HttpUser):
         fields["allow"] = "Authorize"
         csrf = _extract_csrf_from_cookies(self.client)
         post_url = f"{self.aap_url}/o/authorize/"
-        # AAP OAuth consent POST (external); required to finish OAuth with password grant flow.
         with self.client.post(
             post_url, data=fields,
             headers={"X-CSRFToken": csrf, "Referer": post_url},
@@ -512,67 +536,69 @@ class EEBuilderUser(HttpUser):
             resp.success()
 
     def _phase_auth(self):
-        with self.client.get(
-            "/api/auth/rhaap/refresh",
-            params={"env": "production"},
-            headers=self._headers(),
-            name="[auth] GET /api/auth/rhaap/refresh",
-            catch_response=True,
-        ) as resp:
-            if not resp.ok:
-                resp.failure(f"Refresh returned {resp.status_code}")
-                if resp.status_code in (401, 403):
-                    logger.warning("Token refresh unauthorized (%s); re-running OAuth", resp.status_code)
-                    self._do_initial_oauth()
-                return
-            try:
-                body = resp.json()
-                bs = body.get("backstageIdentity", {})
-                new_token = bs.get("token")
-                if new_token:
-                    self.token = new_token
-                ident = bs.get("identity", {})
-                ref = ident.get("userEntityRef", "")
-                if ref:
-                    self.username = ref.split("/")[-1]
-                refs = ident.get("ownershipEntityRefs", [])
-                if refs:
-                    self.owner_ref = refs[0]
-                prov = body.get("providerInfo", {})
-                new_aap_token = prov.get("accessToken")
-                if new_aap_token:
-                    self.aap_token = new_aap_token
-                resp.success()
-            except Exception as exc:
-                resp.failure(f"Parse error: {exc}")
+        """
+        Refresh the portal token to keep long tests authenticated.
+        Policy:
+        - 401/403 => stop the user
+        - 5xx => retry once, then stop the user
+        - any other non-2xx => stop the user
+        """
+
+        for attempt in (1, 2):
+            name = "[auth] GET /api/auth/rhaap/refresh" if attempt == 1 else "[auth] GET /api/auth/rhaap/refresh (retry)"
+            with self.client.get(
+                "/api/auth/rhaap/refresh",
+                params={"env": "production"},
+                headers=self._headers(),
+                name=name,
+                catch_response=True,
+            ) as resp:
+                status = resp.status_code
+
+                if status in (401, 403):
+                    resp.failure(f"Refresh unauthorized ({status}); stopping user")
+                    raise StopUser()
+
+                if 500 <= status <= 599:
+                    if attempt == 1:
+                        resp.failure(f"Refresh server error ({status}); retrying once")
+                        continue
+                    resp.failure(f"Refresh server error ({status}); stopping user")
+                    raise StopUser()
+
+                if not resp.ok:
+                    resp.failure(f"Refresh failed ({status}); stopping user")
+                    raise StopUser()
+
+                try:
+                    body = resp.json()
+                    bs = body.get("backstageIdentity", {}) if isinstance(body, dict) else {}
+                    new_token = bs.get("token") if isinstance(bs, dict) else None
+                    if new_token:
+                        self.token = new_token
+                    ident = bs.get("identity", {}) if isinstance(bs, dict) else {}
+                    ref = ident.get("userEntityRef", "")
+                    if ref:
+                        self.username = ref.split("/")[-1]
+                    refs = ident.get("ownershipEntityRefs", [])
+                    if refs:
+                        self.owner_ref = refs[0]
+                    resp.success()
+                    return
+                except Exception as exc:
+                    resp.failure(f"Refresh parse error: {exc}; stopping user")
+                    raise StopUser()
 
     def _phase_ee_definitions_and_templates(self):
-        """
-        EE builder catalog only: existing EE definition files (Components), then EE scaffolder templates.
-        """
-        self._get(
-            "/api/catalog/entities?filter=kind%3DComponent%2Cspec.type%3Dexecution-environment"
-            "&order=asc%3Ametadata.name",
-            "[eb.catalog.ee_defs] GET EE definition components (ordered)",
+        """EE builder catalog only: existing EE definition files (Components), then EE scaffolder templates."""
+        self._catalog_by_query_paginated(
+            CATALOG_FILTER_EE_DEFS,
+            "[eb.catalog.ee_defs] GET EE definition components",
         )
         self._get(
-            "/api/catalog/entities?filter=spec.type%3Dexecution-environment%2Ckind%3Dtemplate"
-            "&order=asc%3Ametadata.name",
-            "[eb.catalog.templates] GET EE templates (ordered)",
+            CATALOG_PATH_EE_TEMPLATES,
+            "[eb.catalog.templates] GET EE templates",
         )
-        self._get(
-            "/api/catalog/entities/by-query?limit=0&filter=spec.type%3Dexecution-environment%2Ckind%3Dtemplate",
-            "[eb.catalog.templates] GET EE templates (total)",
-        )
-        if self.owner_ref:
-            owned_filter = (
-                "spec.type%3Dexecution-environment%2Ckind%3Dtemplate%2Crelations.ownedBy%3D"
-                f"{self.owner_ref}"
-            )
-            self._get(
-                f"/api/catalog/entities/by-query?limit=0&filter={owned_filter}",
-                "[eb.catalog.templates] GET EE templates (owned)",
-            )
 
     def _phase_template_details(self):
         """Fetch template details and schema."""
@@ -596,107 +622,39 @@ class EEBuilderUser(HttpUser):
             "token": self.aap_token,
             "context": {"searchQuery": "spec.type=ansible-collection"},
         }
-        with self._post(
+        self._post(
             AUTOCOMPLETE_COLLECTIONS_PATH,
             "[eb.scaffolder.autocomplete.list] POST autocomplete collections",
             json_body=payload,
             catch_response=True,
-        ) as resp:
-            if not resp.ok:
-                resp.failure(f"Autocomplete collections failed: {resp.status_code}")
-                return False
-            try:
-                body = resp.json()
-                parsed = _parse_collection_names_from_autocomplete_results(body)
-                if parsed:
-                    self.available_collections = parsed
-                    logger.debug(
-                        "Autocomplete: %s collections from results[].name (or fallback parse)",
-                        len(self.available_collections),
-                    )
-                    resp.success()
-                    return True
-                resp.success()
-                return False
-            except Exception as exc:
-                resp.failure(f"Parse autocomplete collections error: {exc}")
-                return False
-
-    def _fetch_collections_from_catalog(self):
-        """Fallback: load collection names from catalog API (by-query)."""
-        offset = getattr(self, "_collections_catalog_offset", 0)
-        with self._get(
-            f"/api/catalog/entities/by-query?limit={COLLECTIONS_CATALOG_LIMIT}&offset={offset}"
-            "&filter=kind%3DComponent%2Cspec.type%3Dansible-collection",
-            "[eb.catalog.collections] GET collections catalog (for EE)",
-            catch_response=True,
-        ) as resp:
-            if not resp.ok:
-                resp.failure(f"Fetch collections failed: {resp.status_code}")
-                return
-            try:
-                body = resp.json()
-                items = body.get("items", [])
-                for item in items:
-                    spec = item.get("spec", {})
-                    collection_name = spec.get("collection_fullname")
-                    if collection_name:
-                        self.available_collections.append(collection_name)
-                logger.debug(
-                    "Catalog fallback: %s collections for EE creation",
-                    len(self.available_collections),
-                )
-                self._collections_catalog_offset = offset + COLLECTIONS_CATALOG_LIMIT
-                resp.success()
-            except Exception as exc:
-                resp.failure(f"Parse collections error: {exc}")
+        )
 
     def _phase_fetch_collections(self):
+        """Autocomplete only (names for scaffolder EE payload); catalog pagination is separate."""
         self.available_collections = []
-        self._collections_catalog_offset = 0
 
         if not self.aap_token:
-            logger.warning("No AAP token; using catalog API for collection names")
-            self._fetch_collections_from_catalog()
+            logger.warning("No AAP token; EE create will use default collection names")
             return
 
         if self._fetch_collections_from_autocomplete():
             return
 
-        logger.warning(
-            "Autocomplete returned no collections; falling back to catalog API",
-        )
-        self._fetch_collections_from_catalog()
-
     def _phase_collections_catalog_page(self):
-        """Collections catalog page (ordered list), same family as the portal UI."""
-        self._get(
-            "/api/catalog/entities?filter=kind%3DComponent%2Cspec.type%3Dansible-collection"
-            "&order=asc%3Ametadata.name",
-            "[eb.catalog.collections] GET collections page (ordered)",
+        """Collections catalog page (paginated by-query), same family as the portal UI."""
+        self._catalog_by_query_paginated(
+            CATALOG_FILTER_COLLECTIONS,
+            "[eb.catalog.collections] GET collections page",
         )
 
     def _phase_git_repositories(self):
-        """List git-repository catalog components, then open one repo (detail by name)."""
-        list_path = "/api/catalog/entities?filter=kind%3DComponent%2Cspec.type%3Dgit-repository"
-        resp = self._get(list_path, "[eb.catalog.git] GET git repositories")
-        if not resp.ok:
-            return
-        try:
-            raw = resp.json()
-        except json.JSONDecodeError:
-            logger.warning("Git repositories list: invalid JSON")
-            return
-
-        entities = _catalog_entities_list(raw)
-        if not entities:
-            logger.debug("No git-repository entities in catalog; skipping drill-down")
-            return
-
-        entity = entities[0]
-        name = (entity.get("metadata") or {}).get("name")
+        """Paginated git-repository catalog, then open one repo (detail by name)."""
+        name = self._catalog_by_query_paginated(
+            CATALOG_FILTER_GIT,
+            "[eb.catalog.git] GET git repositories",
+        )
         if not name:
-            logger.debug("First git-repository entity has no metadata.name; skipping drill-down")
+            logger.debug("No git-repository entities in catalog; skipping drill-down")
             return
 
         enc = quote(str(name), safe="")
@@ -710,16 +668,9 @@ class EEBuilderUser(HttpUser):
         """Generate random string for EE names."""
         return ''.join(random.choices(string.ascii_lowercase + string.digits, k=length))
 
-    def _select_random_collections(self):
+    def _default_collections(self):
         """Select collections for EE definition (first N from collections API)."""
-        if not self.available_collections:
-            return [
-                {"name": "amazon.aws"},
-                {"name": "ansible.posix"}
-            ]
-
-        selected = self.available_collections[:COLLECTIONS_PER_EE]
-        return [{"name": c} for c in selected]
+        return [{"name": "amazon.aws"}, {"name": "ansible.posix"}]
 
     def _create_ee_definition_task(self, use_scm=False):
         if not self.template_name:
@@ -742,7 +693,7 @@ class EEBuilderUser(HttpUser):
         name = self.template_name
         ee_file_name = self._generate_random_string(8)
         ee_description = EE_DESCRIPTION
-        collections = self._select_random_collections()
+        collections = self._default_collections()
 
         if use_scm:
             publish_and_build = {
@@ -772,58 +723,50 @@ class EEBuilderUser(HttpUser):
             )
             ee_description = f"{EE_DESCRIPTION} [SCM] {ee_file_name}"
         else:
-            publish_and_build = {
-                "publishToSCM": False,
-                "sourceControlProvider": {
-                    "provider": "github",
-                    "providerLabel": "Github",
-                    "org": "",
-                    "repoName": "",
-                    "repoExists": False,
-                },
-                "buildExecutionEnvironment": False,
-            }
+            # Non-SCM: match portal POST /api/scaffolder/v2/tasks (browser curl).
             task_label = "[eb.scaffolder.tasks] POST create EE definition (non-SCM)"
-            tags = ["execution-environment", "non-scm", ee_file_name]
-            advanced_configuration = {
-                "specifyRequirements": False,
-                "addBuildSteps": False,
-                "additionalBuildSteps": [],
-                "pythonRequirements": [],
-                "systemPackages": [],
+            task_body = {
+                "templateRef": f"template:{ns}/{name}",
+                "values": {
+                    "baseImage": DEFAULT_BASE_IMAGE,
+                    "collections": [{"name": "amazon.aws"}],
+                    "advancedConfiguration": {
+                        "specifyRequirements": False,
+                        "addBuildSteps": False,
+                    },
+                    "tags": ["execution-environment"],
+                    "publishAndBuild": {
+                        "publishToSCM": False,
+                        "sourceControlProvider": {},
+                    },
+                    "eeFileName": ee_file_name,
+                    "templateDescription": ee_description,
+                },
             }
-            collections_for_task = collections
+            if self.aap_token:
+                task_body["secrets"] = {"aapToken": self.aap_token}
 
-        task_body = {
-            "templateRef": f"template:{ns}/{name}",
-            "values": {
-                "baseImage": DEFAULT_BASE_IMAGE,
-                "collections": collections_for_task,
-                "advancedConfiguration": advanced_configuration,
-                "tags": tags,
-                "publishAndBuild": publish_and_build,
-                "eeFileName": ee_file_name,
-                "templateDescription": ee_description,
-            },
-        }
-
-        secrets = {}
-        if self.aap_token:
-            secrets["aapToken"] = self.aap_token
-        if self.github_user_oauth_token:
-            secrets["USER_OAUTH_TOKEN"] = self.github_user_oauth_token
-        if secrets:
-            task_body["secrets"] = secrets
-
-        try:
-            logger.info(
-                "POST /api/scaffolder/v2/tasks body (%s): %s",
-                "SCM" if use_scm else "non-SCM",
-                json.dumps(_task_create_body_for_log(task_body)),
-            )
-        except (TypeError, ValueError) as exc:
-            logger.warning("Could not serialize scaffolder task body for logging: %s", exc)
-
+        if use_scm:
+            task_body = {
+                "templateRef": f"template:{ns}/{name}",
+                "values": {
+                    "baseImage": DEFAULT_BASE_IMAGE,
+                    "collections": collections_for_task,
+                    "advancedConfiguration": advanced_configuration,
+                    "tags": tags,
+                    "publishAndBuild": publish_and_build,
+                    "eeFileName": ee_file_name,
+                    "templateDescription": ee_description,
+                },
+            }
+            secrets = {}
+            if self.aap_token:
+                secrets["aapToken"] = self.aap_token
+            if self.github_user_oauth_token:
+                secrets["USER_OAUTH_TOKEN"] = self.github_user_oauth_token
+            if secrets:
+                task_body["secrets"] = secrets
+    
         with self._post(
             "/api/scaffolder/v2/tasks",
             task_label,
@@ -843,18 +786,15 @@ class EEBuilderUser(HttpUser):
                 if isinstance(data, dict):
                     task_id = data.get("id") or data.get("taskId")
                 if not task_id:
+                    resp.failure(
+                        f"Scaffolder POST ok but no task id in JSON (name={ee_file_name})",
+                    )
                     logger.warning(
                         "Scaffolder POST ok but no task id in JSON (name=%s): %s",
                         ee_file_name,
                         data,
                     )
-                logger.debug(
-                    "Created EE definition task: %s (name=%s, collections=%s, scm=%s)",
-                    task_id,
-                    ee_file_name,
-                    len(collections_for_task),
-                    use_scm,
-                )
+                    return None
                 resp.success()
                 return {
                     "task_id": task_id,
@@ -880,12 +820,7 @@ class EEBuilderUser(HttpUser):
                 )
                 resp.failure(f"Task status GET failed: {resp.status_code} {detail}")
                 return
-            try:
-                body = resp.json()
-            except Exception as exc:
-                resp.request_meta["name"] = "[eb.scaffolder.tasks] GET task status (parse error)"
-                resp.failure(f"Task status JSON error: {exc}")
-                return
+            body = resp.json()
             status = _scaffolder_run_status_from_body(body)
             resp.request_meta["name"] = (
                 f"[eb.scaffolder.tasks] GET task status ({status})"
@@ -935,7 +870,7 @@ class EEBuilderUser(HttpUser):
             self.client.get(
                 "/api/scaffolder/v2/tasks",
                 headers=self._headers(),
-                name="[eb.scaffolder.tasks] GET task history (page 1)",
+                name="[eb.scaffolder.tasks] GET task history",
                 params={
                     "createdBy": f"user:default/{self.username}",
                     "limit": 10,
@@ -1014,12 +949,13 @@ class EEBuilderUser(HttpUser):
     def ee_builder_workflow(self):
         self._phase_auth()
         self._phase_ee_definitions_and_templates()
-        self._phase_auth()
         self._phase_template_details()
-        self._phase_fetch_collections()
         self._phase_collections_catalog_page()
         self._phase_git_repositories()
+        self._phase_fetch_collections()
+    @task
+    def scaffolder_create(self):
         self._phase_auth()
         created = self._phase_scaffolder_create()
-        self._phase_view_created_definitions(created)
-
+        if created:
+            self._phase_view_created_definitions(created)
