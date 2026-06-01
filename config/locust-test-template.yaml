@@ -14,7 +14,7 @@ spec:
       --run-time ${DURATION}
       --aap-url ${AAP_URL}
       --aap-password ${AAP_PASSWORD}
-      --scaffolder-task-status-delay-seconds ${SCAFFOLDER_TASK_STATUS_DELAY_SECONDS}
+      ${EE_BUILDER_LOCUST_CMD}
       ${GITHUB_USER_OAUTH_TOKEN_FLAG}
     extraArgs:
       - "--loglevel"
@@ -24,7 +24,7 @@ spec:
       --locustfile /lotest/src/${SCENARIO}.py
       --aap-url ${AAP_URL}
       --aap-password ${AAP_PASSWORD}
-      --scaffolder-task-status-delay-seconds ${SCAFFOLDER_TASK_STATUS_DELAY_SECONDS}
+      ${EE_BUILDER_LOCUST_CMD}
       ${AAP_ACCESS_TOKEN_FLAG}
       ${GITHUB_USER_OAUTH_TOKEN_FLAG}
     extraArgs:
