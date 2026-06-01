@@ -15,13 +15,10 @@ export AAP_NAMESPACE ?= ansible-automation-platform
 export PORTAL_ROUTE ?= sap
 export AAP_ROUTE ?= aap
 
-
-export AAP_PASSWORD ?= redhat123
-
 # Secret containing AAP admin password (data key: password)
 AAP_ADMIN_SECRET ?= $(AAP_ROUTE)-admin-password
 
-# Optional: AAP access token for Locust mvp (scaffolder secrets.aapToken); set in test.env
+# ee-builder logs in as user-001..user-N (not admin); override in test.env if needed
 AAP_ACCESS_TOKEN ?=
 export AAP_ACCESS_TOKEN
 
@@ -107,12 +104,15 @@ endif
 	@if [ -f test.env ]; then cp -f test.env $(TMP_DIR)/test.env && echo "Snapshotted test.env -> $(TMP_DIR)/test.env"; fi
 	@PORTAL_URL="https://$$(oc -n $(PORTAL_NAMESPACE) get route $(PORTAL_ROUTE) -o jsonpath='{.spec.host}')"; \
 	AAP_URL="https://$$(oc -n $(AAP_NAMESPACE) get route $(AAP_ROUTE) -o jsonpath='{.spec.host}')"; \
-	if [ "$(SCENARIO)" != "ee-builder" ]; then \
+	if [ "$(SCENARIO)" = "ee-builder" ]; then \
+		AAP_PASSWORD="$${AAP_PASSWORD:-redhat123}"; \
+		[ -n "$$AAP_PASSWORD" ] || { echo "ERROR: set AAP_PASSWORD in test.env (password for user-001..user-N)" >&2; exit 1; }; \
+		export AAP_ACCESS_TOKEN_FLAG="$${AAP_ACCESS_TOKEN:+--aap-access-token $$AAP_ACCESS_TOKEN}"; \
+		export GITHUB_USER_OAUTH_TOKEN_FLAG="$${GITHUB_USER_OAUTH_TOKEN:+--github-user-oauth-token $$GITHUB_USER_OAUTH_TOKEN}"; \
+	else \
 		AAP_PASSWORD="$$(oc -n $(AAP_NAMESPACE) get secret $(AAP_ADMIN_SECRET) -o jsonpath='{.data.password}' 2>/dev/null | base64 -d)"; \
+		[ -n "$$AAP_PASSWORD" ] || { echo "ERROR: empty admin password (secret $(AAP_ADMIN_SECRET) in $(AAP_NAMESPACE))" >&2; exit 1; }; \
 	fi; \
-	[ -n "$$AAP_PASSWORD" ] || { echo "ERROR: empty admin password (secret $(AAP_ADMIN_SECRET) in $(AAP_NAMESPACE))" >&2; exit 1; }; \
-	export AAP_ACCESS_TOKEN_FLAG="$${AAP_ACCESS_TOKEN:+--aap-access-token $$AAP_ACCESS_TOKEN}"; \
-	export GITHUB_USER_OAUTH_TOKEN_FLAG="$${GITHUB_USER_OAUTH_TOKEN:+--github-user-oauth-token $$GITHUB_USER_OAUTH_TOKEN}"; \
 	export PORTAL_URL AAP_URL AAP_PASSWORD; \
 	echo "Portal URL: $$PORTAL_URL"; \
 	echo "AAP URL:    $$AAP_URL"; \

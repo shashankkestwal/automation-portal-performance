@@ -1,6 +1,5 @@
 import json
 import re
-import time
 import logging
 from urllib.parse import unquote, unquote_plus
 
@@ -89,7 +88,6 @@ class PortalUser(HttpUser):
     def on_start(self):
         self.client.verify = False
         self.token = None
-        self._last_portal_refresh_at = 0.0
         self.aap_token = None
         self.username = None
         self.owner_ref = None
@@ -104,7 +102,6 @@ class PortalUser(HttpUser):
         if not self.token:
             logger.error("OAuth did not yield a portal token; stopping user to avoid 4xx API calls")
             raise StopUser()
-        self._last_portal_refresh_at = time.time()
 
     def _headers(self):
         h = {"X-Requested-With": "XMLHttpRequest"}
@@ -256,39 +253,58 @@ class PortalUser(HttpUser):
             resp.success()
 
     def _phase_auth(self):
-        with self.client.get(
-            "/api/auth/rhaap/refresh",
-            params={"env": "production"},
-            headers=self._headers(),
-            name="[auth] GET /api/auth/rhaap/refresh",
-            catch_response=True,
-        ) as resp:
-            if not resp.ok:
-                resp.failure(f"Refresh returned {resp.status_code}")
-                if resp.status_code in (401, 403):
-                    logger.warning("Token refresh unauthorized (%s); re-running OAuth", resp.status_code)
-                    self._do_initial_oauth()
-                return
-            try:
-                body = resp.json()
-                bs = body.get("backstageIdentity", {})
-                new_token = bs.get("token")
-                if new_token:
-                    self.token = new_token
-                ident = bs.get("identity", {})
-                ref = ident.get("userEntityRef", "")
-                if ref:
-                    self.username = ref.split("/")[-1]
-                refs = ident.get("ownershipEntityRefs", [])
-                if refs:
-                    self.owner_ref = refs[0]
-                prov = body.get("providerInfo", {})
-                new_aap_token = prov.get("accessToken")
-                if new_aap_token:
-                    self.aap_token = new_aap_token
-                resp.success()
-            except Exception as exc:
-                resp.failure(f"Parse error: {exc}")
+        """
+        Refresh the portal token to keep long tests authenticated.
+        Policy:
+        - 401/403 => stop the user
+        - 5xx => retry once, then stop the user
+        - any other non-2xx => stop the user
+        """
+
+        for attempt in (1, 2):
+            name = "[auth] GET /api/auth/rhaap/refresh" if attempt == 1 else "[auth] GET /api/auth/rhaap/refresh (retry)"
+            with self.client.get(
+                "/api/auth/rhaap/refresh",
+                params={"env": "production"},
+                headers=self._headers(),
+                name=name,
+                catch_response=True,
+            ) as resp:
+                status = resp.status_code
+
+                if status in (401, 403):
+                    resp.failure(f"Refresh unauthorized ({status}); stopping user")
+                    raise StopUser()
+
+                if 500 <= status <= 599:
+                    if attempt == 1:
+                        resp.failure(f"Refresh server error ({status}); retrying once")
+                        continue
+                    resp.failure(f"Refresh server error ({status}); stopping user")
+                    raise StopUser()
+
+                if not resp.ok:
+                    resp.failure(f"Refresh failed ({status}); stopping user")
+                    raise StopUser()
+
+                try:
+                    body = resp.json()
+                    bs = body.get("backstageIdentity", {}) if isinstance(body, dict) else {}
+                    new_token = bs.get("token") if isinstance(bs, dict) else None
+                    if new_token:
+                        self.token = new_token
+                    ident = bs.get("identity", {}) if isinstance(bs, dict) else {}
+                    ref = ident.get("userEntityRef", "")
+                    if ref:
+                        self.username = ref.split("/")[-1]
+                    refs = ident.get("ownershipEntityRefs", [])
+                    if refs:
+                        self.owner_ref = refs[0]
+                    resp.success()
+                    return
+                except Exception as exc:
+                    resp.failure(f"Refresh parse error: {exc}; stopping user")
+                    raise StopUser()
 
     def _phase_catalog(self):
         self._get(
