@@ -14,9 +14,6 @@ logger = logging.getLogger(__name__)
 
 AAP_USERNAME = "admin"
 
-PORTAL_TOKEN_REFRESH_INTERVAL_SECONDS = 60
-
-
 TEMPLATE_NAMESPACE = "default"
 
 @events.init_command_line_parser.add_listener
@@ -259,59 +256,39 @@ class PortalUser(HttpUser):
             resp.success()
 
     def _phase_auth(self):
-        """
-        Refresh the portal token to keep long tests authenticated.
-        Policy:
-        - 401/403 => stop the user
-        - 5xx => retry once, then stop the user
-        - any other non-2xx => stop the user
-        """
-
-        for attempt in (1, 2):
-            name = "[auth] GET /api/auth/rhaap/refresh" if attempt == 1 else "[auth] GET /api/auth/rhaap/refresh (retry)"
-            with self.client.get(
-                "/api/auth/rhaap/refresh",
-                params={"env": "production"},
-                headers=self._headers(),
-                name=name,
-                catch_response=True,
-            ) as resp:
-                status = resp.status_code
-
-                if status in (401, 403):
-                    resp.failure(f"Refresh unauthorized ({status}); stopping user")
-                    raise StopUser()
-
-                if 500 <= status <= 599:
-                    if attempt == 1:
-                        resp.failure(f"Refresh server error ({status}); retrying once")
-                        continue
-                    resp.failure(f"Refresh server error ({status}); stopping user")
-                    raise StopUser()
-
-                if not resp.ok:
-                    resp.failure(f"Refresh failed ({status}); stopping user")
-                    raise StopUser()
-
-                try:
-                    body = resp.json()
-                    bs = body.get("backstageIdentity", {}) if isinstance(body, dict) else {}
-                    new_token = bs.get("token") if isinstance(bs, dict) else None
-                    if new_token:
-                        self.token = new_token
-                    ident = bs.get("identity", {}) if isinstance(bs, dict) else {}
-                    ref = ident.get("userEntityRef", "")
-                    if ref:
-                        self.username = ref.split("/")[-1]
-                    refs = ident.get("ownershipEntityRefs", [])
-                    if refs:
-                        self.owner_ref = refs[0]
-                    self._last_portal_refresh_at = time.time()
-                    resp.success()
-                    return
-                except Exception as exc:
-                    resp.failure(f"Refresh parse error: {exc}; stopping user")
-                    raise StopUser()
+        with self.client.get(
+            "/api/auth/rhaap/refresh",
+            params={"env": "production"},
+            headers=self._headers(),
+            name="[auth] GET /api/auth/rhaap/refresh",
+            catch_response=True,
+        ) as resp:
+            if not resp.ok:
+                resp.failure(f"Refresh returned {resp.status_code}")
+                if resp.status_code in (401, 403):
+                    logger.warning("Token refresh unauthorized (%s); re-running OAuth", resp.status_code)
+                    self._do_initial_oauth()
+                return
+            try:
+                body = resp.json()
+                bs = body.get("backstageIdentity", {})
+                new_token = bs.get("token")
+                if new_token:
+                    self.token = new_token
+                ident = bs.get("identity", {})
+                ref = ident.get("userEntityRef", "")
+                if ref:
+                    self.username = ref.split("/")[-1]
+                refs = ident.get("ownershipEntityRefs", [])
+                if refs:
+                    self.owner_ref = refs[0]
+                prov = body.get("providerInfo", {})
+                new_aap_token = prov.get("accessToken")
+                if new_aap_token:
+                    self.aap_token = new_aap_token
+                resp.success()
+            except Exception as exc:
+                resp.failure(f"Parse error: {exc}")
 
     def _phase_catalog(self):
         self._get(
@@ -328,10 +305,21 @@ class PortalUser(HttpUser):
                 try:
                     templates = resp.json()
                     if templates and not self.template_name:
-                        first = templates[0]
-                        metadata = first.get("metadata", {})
-                        self.template_name = metadata.get("name", "")
-                        self.template_namespace = metadata.get("namespace", TEMPLATE_NAMESPACE)
+                        for tpl in templates:
+                            metadata = tpl.get("metadata", {})
+                            if "aapJobTemplateId" not in metadata:
+                                continue
+                            spec = tpl.get("spec", {})
+                            params = spec.get("parameters", [])
+                            if not any(p.get("required") for p in params if isinstance(p, dict)):
+                                self.template_name = metadata.get("name", "")
+                                self.template_namespace = metadata.get("namespace", TEMPLATE_NAMESPACE)
+                                break
+                        if not self.template_name and templates:
+                            first = templates[0]
+                            metadata = first.get("metadata", {})
+                            self.template_name = metadata.get("name", "")
+                            self.template_namespace = metadata.get("namespace", TEMPLATE_NAMESPACE)
                 except (json.JSONDecodeError, IndexError, KeyError):
                     logger.warning("Could not parse template list from catalog")
                 resp.success()
@@ -446,18 +434,10 @@ class PortalUser(HttpUser):
             f"/api/scaffolder/v2/tasks?createdBy=user:default/{user}&limit=10&offset=10",
             "[history] GET /api/scaffolder/v2/tasks (page 2)")
 
-    # Locust samples tasks by weight. 10:1 => ten "journey" iterations per one
-    # "scaffolder" iteration on average (not 10:1 per HTTP name).
-    @task(5)
+    @task
     def user_journey(self):
         self._phase_auth()
         self._phase_catalog()
+        self._phase_scaffolder()
         self._phase_history()
         self._phase_sync()
-
-    @task(1)
-    def scaffold_task(self):
-        self._phase_auth()
-        if not self.template_name:
-            self._phase_catalog()
-        self._phase_scaffolder()
