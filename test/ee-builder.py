@@ -44,8 +44,8 @@ AUTOCOMPLETE_COLLECTIONS_PATH = "/api/scaffolder/v2/autocomplete/aap-api-cloud/c
 # GitHub org for publishToSCM=true EE task payloads (sourceControlProvider.org).
 EE_SCM_GITHUB_ORG = "test-rhaap-portal"
 
-# Wait after SCM scaffolder success before GET api.github.com/repos/{org}/{repo} (async push).
-SCM_GITHUB_VERIFY_DELAY_SECONDS = 10.0
+# Wait after EE create before status/catalog/history checks (and SCM GitHub verify).
+STATUS_CHECK_DELAY_SECONDS = 10.0
 
 # PAH build / registry — used when SCM image sync to PAH is enabled in publishAndBuild (see below).
 # EE_BUILD_REGISTRY_PAH = "Private Automation Hub (PAH)"
@@ -62,10 +62,13 @@ def _catalog_by_query_page_count(total_items):
 
 
 def _scaffolder_run_status_from_body(body):
-    """Short status label from GET /api/scaffolder/v2/tasks/{id} JSON."""
+    """GET /api/scaffolder/v2/tasks/{id} returns top-level status string."""
     if not isinstance(body, dict):
         return None
-    return body.get("status")
+    status = body.get("status")
+    if isinstance(status, str) and status.strip():
+        return status.strip()
+    return None
 
 
 def _parse_collection_names_from_autocomplete(body):
@@ -144,10 +147,24 @@ def _(parser):
         help="Optional AAP OAuth token for scaffolder secrets.aapToken (see Makefile AAP_ACCESS_TOKEN)",
     )
     parser.add_argument(
-        "--scaffolder-task-status-delay-seconds",
+        "--status-check-delay-seconds",
         type=float,
-        default=10.0,
-        dest="scaffolder_task_status_delay_seconds",
+        default=STATUS_CHECK_DELAY_SECONDS,
+        dest="status_check_delay_seconds",
+        help=(
+            "Seconds to wait after EE create before post-create checks "
+            "(task status, catalog entity, history; ee-builder only)"
+        ),
+    )
+    parser.add_argument(
+        "--use-scm",
+        action="store_true",
+        default=False,
+        dest="use_scm",
+        help=(
+            "Enable SCM EE create + GitHub verify (non-SCM always runs). "
+            "Omit flag when USE_SCM is not true in test.env/Makefile."
+        ),
     )
     parser.add_argument(
         "--ee-template-name",
@@ -162,16 +179,6 @@ def _(parser):
         default="",
         dest="github_user_oauth_token",
         help="Optional GitHub PAT for scaffolder secrets.USER_OAUTH_TOKEN (matches browser curl)",
-    )
-    parser.add_argument(
-        "--scm-github-verify-delay-seconds",
-        type=float,
-        default=SCM_GITHUB_VERIFY_DELAY_SECONDS,
-        dest="scm_github_verify_delay_seconds",
-        help=(
-            "After portal checks, wait this long then GET GitHub API to verify SCM repo exists "
-            "(ee-builder only; default from SCM_GITHUB_VERIFY_DELAY_SECONDS)"
-        ),
     )
 
 
@@ -301,6 +308,8 @@ class EEBuilderUser(HttpUser):
         self.aap_password = opts.aap_password
         self.template_namespace = TEMPLATE_NAMESPACE
         self.template_name = opts.ee_template_name
+        self.status_check_delay_seconds = float(opts.status_check_delay_seconds or 0.0)
+        self.use_scm = bool(getattr(opts, "use_scm", False))
 
         self._do_initial_oauth()
         if not self.token:
@@ -622,23 +631,22 @@ class EEBuilderUser(HttpUser):
             "token": self.aap_token,
             "context": {"searchQuery": "spec.type=ansible-collection"},
         }
-        self._post(
+        with self._post(
             AUTOCOMPLETE_COLLECTIONS_PATH,
             "[eb.scaffolder.autocomplete.list] POST autocomplete collections",
             json_body=payload,
             catch_response=True,
-        )
+        ) as resp:
+            if resp.ok:
+                resp.success()
+            else:
+                resp.failure(f"Autocomplete collections failed: {resp.status_code}")
 
     def _phase_fetch_collections(self):
-        """Autocomplete only (names for scaffolder EE payload); catalog pagination is separate."""
-        self.available_collections = []
-
         if not self.aap_token:
-            logger.warning("No AAP token; EE create will use default collection names")
+            logger.warning("No AAP token; skipping autocomplete collections")
             return
-
-        if self._fetch_collections_from_autocomplete():
-            return
+        self._fetch_collections_from_autocomplete()
 
     def _phase_collections_catalog_page(self):
         """Collections catalog page (paginated by-query), same family as the portal UI."""
@@ -672,7 +680,7 @@ class EEBuilderUser(HttpUser):
         """Select collections for EE definition (first N from collections API)."""
         return [{"name": "amazon.aws"}, {"name": "ansible.posix"}]
 
-    def _create_ee_definition_task(self, use_scm=False):
+    def _phase_scaffolder_create(self, use_scm=False):
         if not self.template_name:
             return None
 
@@ -782,9 +790,7 @@ class EEBuilderUser(HttpUser):
                 if isinstance(data, dict) and data.get("error"):
                     resp.failure(f"Scaffolder error in body: {data.get('error')}")
                     return None
-                task_id = None
-                if isinstance(data, dict):
-                    task_id = data.get("id") or data.get("taskId")
+                task_id = data.get("id") or data.get("taskId")
                 if not task_id:
                     resp.failure(
                         f"Scaffolder POST ok but no task id in JSON (name={ee_file_name})",
@@ -810,7 +816,7 @@ class EEBuilderUser(HttpUser):
         with self.client.get(
             f"/api/scaffolder/v2/tasks/{task_id}",
             headers=self._headers(),
-            name="[eb.scaffolder.tasks] GET task status (pending)",
+            name="[eb.scaffolder.tasks] GET task status",
             catch_response=True,
         ) as resp:
             if not resp.ok:
@@ -820,51 +826,61 @@ class EEBuilderUser(HttpUser):
                 )
                 resp.failure(f"Task status GET failed: {resp.status_code} {detail}")
                 return
-            body = resp.json()
+            try:
+                body = resp.json()
+            except Exception as exc:
+                resp.request_meta["name"] = "[eb.scaffolder.tasks] GET task status (parse error)"
+                resp.failure(f"Task status JSON error: {exc}")
+                return
             status = _scaffolder_run_status_from_body(body)
+            if not status:
+                keys = list(body.keys()) if isinstance(body, dict) else []
+                logger.warning(
+                    "Scaffolder task %s: no status in response (keys=%s, body=%s)",
+                    task_id,
+                    keys,
+                    (resp.text or "")[:400],
+                )
+                status = "unknown"
             resp.request_meta["name"] = (
                 f"[eb.scaffolder.tasks] GET task status ({status})"
             )
             resp.success()
 
-    def _phase_view_created_definitions(self, created):
-        if not created:
+    def _phase_view_created_definitions(self, meta):
+        if not meta:
             return
-        opts = self.environment.parsed_options
-        delay_s = float(
-            getattr(opts, "scaffolder_task_status_delay_seconds", 10.0) or 0.0,
-        )
-        if delay_s > 0:
-            time.sleep(delay_s)
 
-        for meta in created:
-            tid = meta.get("task_id")
-            ee_name = meta.get("ee_file_name")
-            if tid:
-                self._get_scaffolder_task_status(tid)
-            if ee_name:
-                path = (
-                    "/api/catalog/entities/by-name/Component/"
-                    f"{EE_DEFINITION_COMPONENT_NAMESPACE}/{ee_name}"
-                )
-                with self.client.get(
-                    path,
-                    headers=self._headers(),
-                    name="[eb.catalog.ee_definition] GET EE definition entity (by name)",
-                    catch_response=True,
-                ) as resp:
-                    if resp.status_code == 404:
-                        logger.debug(
-                            "EE definition entity not in catalog yet (name=%s)", ee_name
-                        )
-                        resp.success()
-                    elif resp.ok:
-                        resp.success()
-                    else:
-                        detail = (resp.text or "")[:200]
-                        resp.failure(
-                            f"EE definition entity GET failed: {resp.status_code} {detail}",
-                        )
+        if self.status_check_delay_seconds > 0:
+            time.sleep(self.status_check_delay_seconds)
+
+        tid = meta.get("task_id")
+        ee_name = meta.get("ee_file_name")
+        if tid:
+            self._get_scaffolder_task_status(tid)
+        if ee_name:
+            path = (
+                "/api/catalog/entities/by-name/Component/"
+                f"{EE_DEFINITION_COMPONENT_NAMESPACE}/{ee_name}"
+            )
+            with self.client.get(
+                path,
+                headers=self._headers(),
+                name="[eb.catalog.ee_definition] GET EE definition entity (by name)",
+                catch_response=True,
+            ) as resp:
+                if resp.status_code == 404:
+                    logger.debug(
+                        "EE definition entity not in catalog yet (name=%s)", ee_name
+                    )
+                    resp.success()
+                elif resp.ok:
+                    resp.success()
+                else:
+                    detail = (resp.text or "")[:200]
+                    resp.failure(
+                        f"EE definition entity GET failed: {resp.status_code} {detail}",
+                    )
 
         if self.username:
             self.client.get(
@@ -878,13 +894,12 @@ class EEBuilderUser(HttpUser):
                 },
             )
 
-        for meta in created:
-            if not meta.get("use_scm"):
-                continue
-            repo = (meta.get("ee_file_name") or "").strip()
-            org = (self.ee_scm_github_org or "").strip()
-            if not repo or not org:
-                continue
+        if not meta.get("use_scm"):
+            return
+
+        repo = (meta.get("ee_file_name") or "").strip()
+        org = (self.ee_scm_github_org or "").strip()
+        if repo and org:
             self._verify_github_scm_repo_exists(org, repo)
 
     def _verify_github_scm_repo_exists(self, org: str, repo: str) -> None:
@@ -892,14 +907,6 @@ class EEBuilderUser(HttpUser):
         if not token:
             logger.warning("Skipping GitHub SCM verify: no --github-user-oauth-token")
             return
-
-        opts = self.environment.parsed_options
-        delay_s = float(
-            getattr(opts, "scm_github_verify_delay_seconds", SCM_GITHUB_VERIFY_DELAY_SECONDS)
-            or 0.0,
-        )
-        if delay_s > 0:
-            time.sleep(delay_s)
 
         o = quote(org, safe="")
         r = quote(repo, safe="")
@@ -925,7 +932,7 @@ class EEBuilderUser(HttpUser):
                     "(task may still be running or publish failed)",
                 )
                 logger.warning(
-                    "GitHub SCM verify 404 for %s/%s (increase --scm-github-verify-delay-seconds?)",
+                    "GitHub SCM verify 404 for %s/%s (increase --status-check-delay-seconds)",
                     org,
                     repo,
                 )
@@ -935,16 +942,6 @@ class EEBuilderUser(HttpUser):
                 f"GitHub SCM verify failed: HTTP {resp.status_code} {detail}",
             )
 
-    def _phase_scaffolder_create(self):
-        out = []
-        meta = self._create_ee_definition_task(use_scm=False)
-        if meta:
-            out.append(meta)
-        # meta = self._create_ee_definition_task(use_scm=True)
-        # if meta:
-        #     out.append(meta)
-        return out
-
     @task
     def ee_builder_workflow(self):
         self._phase_auth()
@@ -953,9 +950,17 @@ class EEBuilderUser(HttpUser):
         self._phase_collections_catalog_page()
         self._phase_git_repositories()
         self._phase_fetch_collections()
+
     @task
     def scaffolder_create(self):
-        self._phase_auth()
-        created = self._phase_scaffolder_create()
-        if created:
-            self._phase_view_created_definitions(created)
+        self._phase_auth()    
+        meta = self._phase_scaffolder_create(use_scm=False)
+        if meta:
+            self._phase_view_created_definitions(meta)
+
+        # When enabled, also exercise the SCM flow (GitHub publish + verify).
+        if self.use_scm:
+            meta = self._phase_scaffolder_create(use_scm=True)
+            if meta:
+                self._phase_view_created_definitions(meta)
+
