@@ -34,13 +34,19 @@ export USERS ?= 10
 export SPAWN_RATE ?= 2
 export DURATION ?= 10s
 # ee-builder only (see config/locust-test-template.yaml ${EE_BUILDER_LOCUST_CMD})
-export SCAFFOLDER_TASK_STATUS_DELAY_SECONDS ?= 10
-export SCM_GITHUB_VERIFY_DELAY_SECONDS ?= 10
+export STATUS_CHECK_DELAY_SECONDS ?= 10
+# ee-builder: set USE_SCM=true in test.env to pass --use-scm to Locust (SCM + non-SCM creates)
+export USE_SCM ?= false
+USE_SCM_FLAG :=
+ifneq ($(filter true True TRUE 1 yes,$(USE_SCM)),)
+USE_SCM_FLAG := --use-scm
+endif
 EE_BUILDER_LOCUST_CMD :=
 ifeq ($(SCENARIO),ee-builder)
-EE_BUILDER_LOCUST_CMD := --scaffolder-task-status-delay-seconds $(SCAFFOLDER_TASK_STATUS_DELAY_SECONDS) --scm-github-verify-delay-seconds $(SCM_GITHUB_VERIFY_DELAY_SECONDS)
+	EE_BUILDER_LOCUST_CMD := --status-check-delay-seconds $(STATUS_CHECK_DELAY_SECONDS) $(USE_SCM_FLAG)
 endif
 export EE_BUILDER_LOCUST_CMD
+export USE_SCM_FLAG
 export LOCUST_EXTRA_CMD ?= "--debug=true"
 
 # Locust operator
