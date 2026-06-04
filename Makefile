@@ -113,6 +113,9 @@ endif
 	if [ "$(SCENARIO)" = "ee-builder" ]; then \
 		AAP_PASSWORD="$${AAP_PASSWORD:-redhat123}"; \
 		[ -n "$$AAP_PASSWORD" ] || { echo "ERROR: set AAP_PASSWORD in test.env (password for user-001..user-N)" >&2; exit 1; }; \
+		case "$(USE_SCM)" in true|True|TRUE|1|yes|Yes|YES) \
+			[ -n "$${GITHUB_USER_OAUTH_TOKEN}" ] || { echo "ERROR: USE_SCM=true requires GITHUB_USER_OAUTH_TOKEN in test.env" >&2; exit 1; }; \
+		esac; \
 		export AAP_ACCESS_TOKEN_FLAG="$${AAP_ACCESS_TOKEN:+--aap-access-token $$AAP_ACCESS_TOKEN}"; \
 		export GITHUB_USER_OAUTH_TOKEN_FLAG="$${GITHUB_USER_OAUTH_TOKEN:+--github-user-oauth-token $$GITHUB_USER_OAUTH_TOKEN}"; \
 	else \
@@ -138,6 +141,13 @@ endif
 	kubectl logs --namespace $(LOCUST_NAMESPACE) -f -l performance-test-pod-name=$(SCENARIO)-test-master | tee $(TMP_DIR)/load-test.log
 	date -u -Ins>$(TMP_DIR)/benchmark-after
 	@echo "Test completed at $$(date -u -Ins)"
+
+## Run Locust on this machine (headless); same test.env and route discovery as `make test`
+## Usage: make test-local SCENARIO=ee-builder
+.PHONY: test-local
+test-local: $(TMP_DIR)
+	@if [ -f test.env ]; then cp -f test.env $(TMP_DIR)/test.env && echo "Snapshotted test.env -> $(TMP_DIR)/test.env"; fi
+	@./core/run-locust-local.sh
 
 .PHONY: collect-results
 collect-results:

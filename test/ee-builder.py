@@ -322,6 +322,12 @@ class EEBuilderUser(HttpUser):
         self.github_user_oauth_token = (
             getattr(opts, "github_user_oauth_token", None) or ""
         ).strip()
+        if self.use_scm and not self.github_user_oauth_token:
+            logger.error(
+                "USE_SCM/--use-scm is set but --github-user-oauth-token is empty; "
+                "SCM scaffolder POST and GitHub verify are skipped. "
+                "Set GITHUB_USER_OAUTH_TOKEN in test.env.",
+            )
 
     def _headers(self):
         h = {
